@@ -1,0 +1,35 @@
+models:
+  fast: "qwen3:8b"
+  smart: "qwen3:14b"
+  ollama_url: "http://localhost:11434"
+
+whisper:
+  model: "large-v3"
+  device: "cpu"
+  compute_type: "int8"
+  language: "ru"
+  samplerate: 44100
+  
+audio:
+  mic_device: null
+  samplerate: 44100
+  duration: 8
+  silence_duration: 0.8          # быстрее останавливается
+  max_duration: 30
+  min_speech_duration: 0.3
+  conversation_timeout: 60
+  vad_aggressiveness: 1          # средний (0=мягкий, 3=строгий)
+  
+  wake_model_path: "~/secretary/wakeword_training/luna_model.onnx"
+  wake_threshold: 0.85
+  wake_window: 1.5
+  wake_overlap: 0.5
+  wake_debug: true
+
+piper:
+  voice: "~/piper-voices/ru_RU-irina-medium.onnx"
+  samplerate: 22050
+
+logging:
+  file: "secretary.log"
+  level: "INFO"

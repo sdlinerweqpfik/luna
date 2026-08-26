@@ -1,0 +1,30 @@
+# === СЕКРЕТНОЕ (никогда не пушить!) ===
+autostart/.luna_auth
+*.key
+*.pem
+
+# === Личные данные ===
+memory.json
+profile.json
+data/
+secretary.log
+*.log
+
+# === Обучение wake word: тяжёлые данные и записи голоса семьи ===
+wakeword_training/noise/
+wakeword_training/positive/
+wakeword_training/*.xlsx
+wakeword_training/*.csv
+wakeword_training/*.gif
+
+# === Python ===
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+secretary-venv/
+
+# === Системное ===
+.DS_Store
+Thumbs.db
