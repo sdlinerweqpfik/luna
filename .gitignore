@@ -10,12 +10,31 @@ data/
 secretary.log
 *.log
 
-# === Обучение wake word: тяжёлые данные и записи голоса семьи ===
+# === Временные аудио в корне ===
+*.wav
+
+# === Обучение wake word: записи голоса семьи и синтетика ===
+wakeword_training/all_positive/
+wakeword_training/generated/
+wakeword_training/negative/
+wakeword_training/negative_synthetic/
 wakeword_training/noise/
 wakeword_training/positive/
-wakeword_training/*.xlsx
-wakeword_training/*.csv
-wakeword_training/*.gif
+
+# === PyTorch модели (тяжёлые, используем только ONNX) ===
+*.pth
+wakeword_training/*.pth
+
+# === Данные моделей (если очень большие) ===
+# Раскомментируй если .onnx.data окажется >100 МБ:
+# wakeword_training/*.onnx.data
+
+# === Временные скрипты диагностики ===
+diagnose.py
+diagnose_final.py
+diagnose_v2.py
+check_syntax.py
+fix_all.py
 
 # === Python ===
 __pycache__/
@@ -28,3 +47,11 @@ secretary-venv/
 # === Системное ===
 .DS_Store
 Thumbs.db
+
+# Старые прототипы и временные тесты
+secretary.py
+test_commands.py
+test_lists.py
+test_resample.py
+test_simple.py
+test_wakeword.py
