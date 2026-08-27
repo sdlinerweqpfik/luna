@@ -12,6 +12,7 @@ from core.personality import Personality
 import core.memory_tools as memory_tools
 import core.tools as tools_module
 import core.reminders as reminders_module
+import core.speaker_id as speaker_id_module
 
 from config import load_config
 from core.logger import setup_logging
@@ -45,6 +46,8 @@ def is_complex_fast(text):
 
 def handle_request(text, llm, tts, log, memory, personality):
     """Обрабатывает запрос: быстрые команды или LLM"""
+    pending_before = confirmation_manager.get_active()
+
     is_fast, fast_answer = fast_command(text, llm=llm, memory=memory, personality=personality)
     if is_fast:
         print("⚡ Быстрая команда")
@@ -67,7 +70,25 @@ def handle_request(text, llm, tts, log, memory, personality):
         llm.unload(model)
 
     print(f"Луна: {answer}")
-    tts.speak_interruptible(answer)
+
+    # === Confirmation Manager v3: доставка confirmation prompt ===
+    # Если в этом запросе появился новый pending (status pending — ещё не
+    # claimed), то answer — это confirmation prompt: жизненный цикл
+    # claim_for_prompt -> TTS -> mark_prompted / abort_prompting.
+    pending_after = confirmation_manager.get_active()
+    if (pending_after is not None
+            and pending_after is not pending_before
+            and pending_after.status == "pending"):
+        confirmation_manager.claim_for_prompt(pending_after.id)
+        delivered = tts.speak_interruptible(answer)
+        if delivered:
+            confirmation_manager.mark_prompted(pending_after.id)
+            log.info(f"Confirmation prompt {pending_after.id} доставлен")
+        else:
+            confirmation_manager.abort_prompting(pending_after.id)
+            log.info(f"Confirmation prompt {pending_after.id} не доставлен — abort")
+    else:
+        tts.speak_interruptible(answer)
 
 
 def conversation_mode(cfg, recorder, stt, llm, tts, log, memory, personality):
@@ -113,13 +134,10 @@ def conversation_mode(cfg, recorder, stt, llm, tts, log, memory, personality):
             log.info(f"Запрос: {text}")
 
             # === ПОДТВЕРЖДЕНИЕ ОПАСНОГО ДЕЙСТВИЯ (только из голоса!) ===
-            # Если есть активное ожидающее действие — проверяем, является ли
-            # текущий ввод подтверждением или отказом. Это гарантирует что
-            # подтверждение приходит ТОЛЬКО от пользователя, а не от модели.
             decision, pending_action = confirmation_manager.match_user_input(text)
             if decision == "confirm":
                 print(f"🔐 Подтверждение действия: {pending_action.summary}")
-                ok, result = confirmation_manager.confirm(pending_action.id)
+                ok, result = confirmation_manager.confirm(pending_action.id, source="voice")
                 print(f"   → {result}")
                 log.info(f"Действие {pending_action.id} подтверждено: {result}")
                 tts.speak_interruptible(result)
@@ -133,6 +151,13 @@ def conversation_mode(cfg, recorder, stt, llm, tts, log, memory, personality):
                 tts.speak_interruptible(result)
                 last_interaction = time.time()
                 continue  # слово "нет" не передаём модели
+            elif decision == "ambiguous":
+                # Есть активное действие, но фраза неясная: НЕ подтверждаем
+                # и НЕ передаём модели — просим чёткий ответ.
+                print("🔐 Неоднозначный ответ — переспрашиваю")
+                tts.speak_interruptible("Скажи просто: да или нет.")
+                last_interaction = time.time()
+                continue
 
             # Проверяем команды выхода (только как отдельные слова!)
             exit_words = text.lower().split()
@@ -172,10 +197,25 @@ def voice_mode(cfg, recorder, stt, llm, tts, detector, log, memory, personality)
     while True:
         try:
             print("🎙️  Ожидаю слово 'Луна'...")
-            detector.wait_for_wake_word()
+            wake_audio = detector.wait_for_wake_word()
 
             print("\n🔔 Луна активирована!")
             recorder.play_beep(800, 0.15)
+
+            # Voice ID: определяем говорящего один раз по аудио активации,
+            # не на каждую реплику разговора (см. core/speaker_id.py про
+            # обоснование). Если распознавание падает по любой причине
+            # (модель не загрузилась, аудио пустое) — тихо остаёмся на
+            # текущем speaker_id, разговор не должен срываться из-за этого.
+            if wake_audio is not None:
+                try:
+                    recognized_id, distance = speaker_id_module.identify_speaker(wake_audio)
+                    if recognized_id != memory.speaker_id:
+                        log.info(f"Voice ID: переключение на говорящего '{recognized_id}' (было '{memory.speaker_id}')")
+                        memory.switch_speaker(recognized_id)
+                        personality.switch_speaker(recognized_id)
+                except Exception as e:
+                    log.warning(f"Voice ID не сработал, остаюсь на текущем профиле: {e}")
 
             time.sleep(0.3)
             tts.speak("Слушаю")

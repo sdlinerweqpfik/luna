@@ -55,3 +55,7 @@ test_lists.py
 test_resample.py
 test_simple.py
 test_wakeword.py
+voice_profiles/
+*.voice_profile
+enroll_speaker.py
+voice_profiles/

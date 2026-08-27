@@ -1,158 +1,302 @@
 """
-Confirmation Manager v1.
+Confirmation Manager v3 — единственный pending confirmation.
 
-Управляет подтверждением опасных действий. Принцип: опасное действие,
-запрошенное LLM, НЕ выполняется немедленно и НЕ может быть подтверждено
-самой моделью. Вместо этого создаётся "pending action" с уникальным ID,
-который ожидает ЯВНОГО подтверждения от реального пользовательского ввода.
+Жизненный цикл состояния:
 
-Жизненный цикл:
-1. Опасный инструмент вызывает manager.create_pending(...) -> PendingAction
-2. Пользователю озвучивается запрос на подтверждение
-3. Следующий пользовательский ввод проверяется на согласие/отказ (ГОЛОС)
-4. При согласии выполняется сохранённый executor, действие УДАЛЯЕТСЯ
-5. Действие ОДНОРАЗОВОЕ — повторное выполнение невозможно
-6. При превышении срока жизни (expiration) автоматически отменяется
+    pending --claim_for_prompt()--> prompting --mark_prompted()--> prompted
+       |                                  |                            |
+       | (заменён новым create,           | abort_prompting()          | confirm(voice/user)
+       |  пока не claimed)                | (ошибка TTS)               | reject() / TTL
+       v                                  v                            v
+    discarded                          aborted                 executed/rejected/expired
 
-Работает без input() — подтверждение приходит через голосовой цикл в
-conversation_mode, а не через блокирующий текстовый ввод.
+Инварианты v3:
+1. create_pending() создаёт action в состоянии pending.
+2. claim_for_prompt(action_id) — атомарный переход pending -> prompting;
+   вызывается ПЕРЕД передачей confirmation prompt в voice/UI слой.
+3. mark_prompted(action_id) — переход prompting -> prompted; вызывается
+   после успешной передачи / начала фактической озвучки. Стартует TTL.
+4. Пока action в PROMPTING или PROMPTED, второй create_pending() НЕ может
+   его заменить (возвращает None). Заменить можно только unclaimed pending.
+5. abort_prompting(action_id) — явная отмена PROMPTING action при ошибке
+   TTS; после неё слот свободен для следующего create_pending().
+6. Expiration атомарен: единственный переход в expired и удаление из слота
+   выполняет _purge_expired_locked() под lock (нет рассинхрона состояния).
+7. confirm() атомарен (claim под lock), executor ВСЕГДА вне lock,
+   source-gate {"voice","user"} и monotonic-TTL — как в v2, без изменений.
+8. match_user_input() строгий: подтверждают только короткие чистые фразы
+   из whitelist; негация/контекст/длинные/неизвестные фразы -> ambiguous.
+
+Соответствие тестов (tests/test_confirmation.py):
+  C1 — единственный pending (replace unclaimed; block prompting/prompted)
+  C2 — параллельный confirm: один победил, executor 1 раз, повторное «да» no-op
+  H1 — executor вне lock (реентерабельность без deadlock)
+  H2 — source-gate: только voice/user
+  H3 — TTL от mark_prompted(); expiration удаляет
+  M1 — «да нет» => ambiguous, не подтверждает; чистое «да» подтверждает
+  M2 — строгий matcher: контекст/негация/длинные/неизвестные => ambiguous
+  P1 — lifecycle prompting: claim, блокировка create, abort_prompting (TTS error)
+  X1 — confirm до delivered prompt отклоняется
+  A1 — гонка claim_for_prompt vs create_pending (потоки): состояние консистентно
+  A2 — гонка expiration под параллельным доступом: expired ровно один раз,
+       executor не запускается, слот пуст
 """
-
 import re
+import time
 import uuid
 import logging
 import threading
-from datetime import datetime, timedelta
+from datetime import datetime
 
 log = logging.getLogger("secretary.confirmation")
 
-# Слова согласия и отказа для голосового подтверждения
-CONFIRM_WORDS = {
-    "да", "подтверждаю", "подтверди", "давай", "выполняй", "выполни",
-    "делай", "сделай", "ок", "хорошо", "конечно", "согласен", "согласна",
-}
-REJECT_WORDS = {
-    "нет", "не", "отмена", "отмени", "стоп", "не надо", "не нужно",
-    "передумал", "передумала", "назад", "проехали",
-}
-
-# Время жизни подтверждения по умолчанию (секунды)
 DEFAULT_TTL_SECONDS = 60
+
+# Только эти источники могут подтверждать опасное действие.
+ALLOWED_CONFIRM_SOURCES = frozenset({"voice", "user"})
+
+# Состояния
+STATUS_PENDING = "pending"        # создан, промпт ещё не уходит в voice/UI
+STATUS_PROMPTING = "prompting"    # промпт передан/передаётся в voice/UI слой
+STATUS_PROMPTED = "prompted"      # промпт реально озвучен, TTL идёт
+STATUS_EXPIRED = "expired"
+
+# Строгий matcher: подтверждают ТОЛЬКО эти короткие чистые фразы.
+CONFIRM_PHRASES = frozenset({
+    "да", "ага", "угу", "ок", "окей", "хорошо", "конечно", "разумеется",
+    "подтверждаю", "подтверди", "давай", "выполняй", "выполни",
+    "делай", "сделай", "согласен", "согласна",
+    "да давай", "да подтверждаю", "да конечно",
+})
+REJECT_PHRASES = frozenset({
+    "нет", "не", "не надо", "не нужно", "отмена", "отмени", "стоп",
+    "отказ", "отказываюсь", "передумал", "передумала", "не делай",
+    "не выполняй",
+})
+NEGATION_TOKENS = frozenset({
+    "нет", "не", "нельзя", "запрещаю", "отмена", "отмени", "стоп",
+    "отказ", "отказываюсь", "передумал", "передумала",
+})
 
 
 class PendingAction:
-    """Одно ожидающее подтверждения действие."""
+    """Одно опасное действие, ожидающее подтверждения пользователя."""
 
     def __init__(self, action_type, summary, payload, executor, ttl_seconds):
-        self.id = uuid.uuid4().hex                     # уникальный ID
-        self.action_type = action_type                 # тип действия (строка)
-        self.summary = summary                         # человекочитаемое описание
-        self.payload = payload                         # данные действия (словарь)
-        self.executor = executor                       # callable(payload) -> str
-        self.created_at = datetime.now()               # timestamp
-        self.expires_at = self.created_at + timedelta(seconds=ttl_seconds)
-        self.status = "pending"                        # pending|confirmed|rejected|expired|executed|error
+        self.id = uuid.uuid4().hex
+        self.action_type = action_type
+        self.summary = summary
+        self.payload = payload
+        self.executor = executor
+        self.ttl_seconds = ttl_seconds
+        self.created_at = time.monotonic()
+        self.created_wall = datetime.now()
+        self.prompted_at = None
+        self.status = STATUS_PENDING
 
     @property
-    def timestamp(self):
-        return self.created_at
+    def is_prompted(self):
+        return self.status == STATUS_PROMPTED or self.prompted_at is not None
 
     @property
     def expiration(self):
-        return self.expires_at
+        """Дедлайн (monotonic) или None, пока TTL не стартовал."""
+        if self.prompted_at is None:
+            return None
+        return self.prompted_at + self.ttl_seconds
 
-    def is_expired(self):
-        return datetime.now() > self.expires_at
+    def is_expired(self, now=None):
+        if self.prompted_at is None:
+            return False
+        now = time.monotonic() if now is None else now
+        return now >= self.prompted_at + self.ttl_seconds
 
 
 class ConfirmationManager:
-    """Менеджер ожидающих подтверждений. Синглтон на всё приложение."""
+    """Менеджер единственного pending confirmation (v3)."""
 
     def __init__(self):
-        self._pending = {}
+        self._pending = None
         self._lock = threading.Lock()
+
+    # ================= ВНУТРЕННЕЕ =================
+
+    def _purge_expired_locked(self):
+        """ЕДИНСТВЕННЫЙ атомарный переход в expired + удаление из слота.
+        Вызывается только под lock, первым делом в точках входа.
+        Возвращает истёкший action или None."""
+        action = self._pending
+        if (action is not None
+                and action.status == STATUS_PROMPTED
+                and action.is_expired()):
+            self._pending = None
+            action.status = STATUS_EXPIRED
+            log.info(f"Pending {action.id} истёк — атомарно удалён из слота")
+            return action
+        return None
+
+    # ================= СОЗДАНИЕ =================
 
     def create_pending(self, action_type, summary, payload, executor,
                        ttl_seconds=DEFAULT_TTL_SECONDS):
-        """Создаёт и регистрирует новое ожидающее действие."""
-        self._purge_expired()
-        action = PendingAction(action_type, summary, payload, executor, ttl_seconds)
-        with self._lock:
-            self._pending[action.id] = action
-        log.info(f"Создано ожидающее действие {action.id} [{action_type}]: {summary}")
-        return action
+        """Создаёт единственный pending action (состояние pending).
 
-    def confirm(self, action_id):
-        """Подтверждает и выполняет действие.
-        Возвращает (успех: bool, результат: str).
-        Действие одноразовое: после выполнения/попытки оно удаляется,
-        повторный вызов с тем же ID ничего не выполнит."""
+        Возвращает PendingAction или None, если слот занят action в
+        PROMPTING/PROMPTED — тогда вызывающий обязан сообщить модели,
+        что другое действие уже ждёт подтверждения.
+
+        Заменить можно только unclaimed pending (промпт ещё не уходил в
+        voice/UI слой — намерения пользователя к нему нет).
+        """
         with self._lock:
-            action = self._pending.pop(action_id, None)   # сразу извлекаем
-        if action is None:
-            return False, "Действие не найдено или уже выполнено."
-        if action.is_expired():
-            action.status = "expired"
-            return False, "Время подтверждения истекло. Повтори запрос заново."
-        if action.status != "pending":
-            return False, f"Действие уже обработано (статус: {action.status})."
+            self._purge_expired_locked()
+            old = self._pending
+            if old is not None:
+                if old.status in (STATUS_PROMPTING, STATUS_PROMPTED):
+                    log.warning(
+                        f"create_pending отклонён: действие {old.id} в "
+                        f"состоянии {old.status} — замена запрещена"
+                    )
+                    return None
+                old.status = "discarded"
+                log.info(f"Pending {old.id} не был claimed — заменён")
+            action = PendingAction(action_type, summary, payload,
+                                   executor, ttl_seconds)
+            self._pending = action
+            log.info(f"Создан pending {action.id} [{action_type}]: {summary}")
+            return action
+
+    # ================= ДОСТАВКА ПРОМПТА =================
+
+    def claim_for_prompt(self, action_id):
+        """Атомарный переход pending -> prompting. Вызывается ПЕРЕД передачей
+        confirmation prompt в voice/UI слой. После этого create_pending()
+        не может заменить действие."""
+        with self._lock:
+            action = self._pending
+            if action is None or action.id != action_id:
+                return False
+            if action.status != STATUS_PENDING:
+                return False
+            action.status = STATUS_PROMPTING
+            log.info(f"Pending {action_id} claimed для передачи промпта")
+            return True
+
+    def mark_prompted(self, action_id):
+        """Переход prompting -> prompted ПОСЛЕ успешной передачи/начала
+        озвучки. Стартует TTL. Идемпотентен для уже prompted."""
+        with self._lock:
+            action = self._pending
+            if action is None or action.id != action_id:
+                return False
+            if action.status == STATUS_PROMPTED:
+                return True
+            if action.status != STATUS_PROMPTING:
+                return False
+            action.prompted_at = time.monotonic()
+            action.status = STATUS_PROMPTED
+            log.info(f"Pending {action_id} озвучен — TTL {action.ttl_seconds}s")
+            return True
+
+    def abort_prompting(self, action_id):
+        """Явная отмена PROMPTING action (ошибка TTS/доставки). Освобождает
+        слот, после чего разрешён следующий create_pending().
+        Работает также для unclaimed pending (сбой до claim).
+        Для PROMPTED используй reject() — это решение пользователя."""
+        with self._lock:
+            action = self._pending
+            if action is None or action.id != action_id:
+                return False
+            if action.status not in (STATUS_PROMPTING, STATUS_PENDING):
+                return False
+            self._pending = None
+            action.status = "aborted"
+            log.info(f"Pending {action_id} aborted (ошибка доставки промпта)")
+            return True
+
+    # ================= РАЗРЕШЕНИЕ =================
+
+    def confirm(self, action_id, source):
+        """Атомарно забирает и выполняет pending action.
+        source обязан быть в ALLOWED_CONFIRM_SOURCES. executor вне lock."""
+        if source not in ALLOWED_CONFIRM_SOURCES:
+            log.warning(f"confirm отклонён для {action_id}: source={source!r}")
+            return False, "Источник подтверждения не разрешён."
+
+        with self._lock:
+            expired = self._purge_expired_locked()
+            if expired is not None and expired.id == action_id:
+                return False, "Время подтверждения истекло."
+            action = self._pending
+            if action is None or action.id != action_id:
+                return False, "Нет действия, ожидающего подтверждения."
+            if action.status != STATUS_PROMPTED:
+                # pending/prompting: промпт не доставлен — осознанное
+                # согласие невозможно. Fail-safe.
+                return False, "Промпт подтверждения ещё не передан пользователю."
+            # Атомарный claim: слот пуст ДО любого выполнения.
+            self._pending = None
+            action.status = "confirmed"
+
+        # Lock отпущен ЗДЕСЬ — executor никогда не выполняется под ним.
         try:
             result = action.executor(action.payload)
-            action.status = "executed"
-            log.info(f"Действие {action.id} выполнено")
-            return True, result
         except Exception as e:
             action.status = "error"
-            log.error(f"Ошибка выполнения действия {action.id}: {e}")
+            log.error(f"Ошибка executor для {action_id}: {e}")
             return False, f"Ошибка при выполнении: {e}"
+        action.status = "executed"
+        log.info(f"Pending {action_id} выполнен")
+        return True, result
 
     def reject(self, action_id):
-        """Отменяет действие."""
+        """Отмена пользователем. Fail-safe: источник не проверяется."""
         with self._lock:
-            action = self._pending.pop(action_id, None)
-        if action is None:
-            return "Нечего отменять."
-        action.status = "rejected"
-        log.info(f"Действие {action.id} отменено пользователем")
+            self._purge_expired_locked()
+            action = self._pending
+            if action is None or action.id != action_id:
+                return "Нечего отменять."
+            self._pending = None
+            action.status = "rejected"
+        log.info(f"Pending {action_id} отклонён пользователем")
         return f"Отменила: {action.summary}."
 
+    # ================= ЗАПРОСЫ / MATCHER =================
+
     def get_active(self):
-        """Возвращает список активных (непросроченных) действий, по старшинству."""
-        self._purge_expired()
+        """Живой pending action или None (expiration удаляет атомарно)."""
         with self._lock:
-            active = [a for a in self._pending.values() if not a.is_expired()]
-        return sorted(active, key=lambda a: a.created_at)
+            self._purge_expired_locked()
+            return self._pending
 
     def has_pending(self):
-        """Есть ли активные ожидающие действия."""
-        return len(self.get_active()) > 0
+        return self.get_active() is not None
 
     def match_user_input(self, text):
-        """Проверяет пользовательский ввод на согласие/отказ активного действия.
-        Возвращает ('confirm'|'reject', action) или (None, None).
-        Подтверждение принимается ТОЛЬКО из пользовательского ввода,
-        никогда из решения модели."""
-        active = self.get_active()
-        if not active:
-            return None, None
-        # извлекаем только буквенные токены, чтобы "да," не ломало сравнение
-        words = set(re.findall(r"[а-яёa-z]+", text.lower()))
-        action = active[0]  # подтверждаем самое старое активное действие
-        if words & CONFIRM_WORDS:
-            return "confirm", action
-        if words & REJECT_WORDS:
-            return "reject", action
-        return None, None
+        """Строгая классификация ВВОДА ПОЛЬЗОВАТЕЛЯ.
 
-    def _purge_expired(self):
-        """Удаляет просроченные действия (ленивая очистка)."""
-        now = datetime.now()
-        with self._lock:
-            expired = [aid for aid, a in self._pending.items() if now > a.expires_at]
-            for aid in expired:
-                self._pending[aid].status = "expired"
-                log.info(f"Действие {aid} просрочено и удалено")
-                del self._pending[aid]
+        Возвращает (decision, action):
+          "confirm"   — только короткая чистая фраза из whitelist
+          "reject"    — только чистая фраза отказа из whitelist
+          "ambiguous" — всё остальное: смешанные токены, негация,
+                        дополнительный контекст, длинные/неизвестные фразы.
+                        НИКОГДА не подтверждает.
+          (None, None) — нет активного pending.
+        Ничего не выполняет — только классификация.
+        """
+        action = self.get_active()
+        if action is None:
+            return None, None
+        tokens = re.findall(r"[а-яёa-z]+", text.lower())
+        if not tokens:
+            return "ambiguous", action
+        norm = " ".join(tokens)
+        has_negation = bool(set(tokens) & NEGATION_TOKENS)
+        if not has_negation and norm in CONFIRM_PHRASES:
+            return "confirm", action
+        if norm in REJECT_PHRASES:
+            return "reject", action
+        return "ambiguous", action
 
 
 # Синглтон для всего приложения
@@ -161,12 +305,21 @@ manager = ConfirmationManager()
 
 def request_confirmation(action_type, summary, payload, executor,
                          ttl_seconds=DEFAULT_TTL_SECONDS):
-    """Удобная обёртка для опасных инструментов: создаёт pending и
-    возвращает готовый ответ для модели, который она озвучит пользователю.
-    Модель НЕ выполняет действие сама — только просит подтверждения."""
-    action = manager.create_pending(action_type, summary, payload, executor, ttl_seconds)
+    """Хелпер для инструментов: создаёт pending и возвращает текст для
+    озвучки. Интеграционный voice/UI слой обязан далее:
+      1. claim_for_prompt(action.id)  — перед передачей промпта в TTS;
+      2. mark_prompted(action.id)     — после начала фактической озвучки;
+      3. abort_prompting(action.id)   — при ошибке TTS/доставки.
+    """
+    action = manager.create_pending(action_type, summary, payload,
+                                    executor, ttl_seconds)
+    if action is None:
+        return (
+            "Другое действие уже ожидает подтверждения пользователя. "
+            "Дождись его решения, прежде чем запрашивать новое."
+        )
     return (
         f"Опасное действие «{summary}» ожидает подтверждения пользователя. "
-        f"Скажи пользователю, что именно будет сделано, и попроси подтвердить "
-        f"словом «да» или отменить словом «нет». НЕ выполняй действие сам."
+        f"Скажи пользователю, что именно будет сделано, и попроси сказать "
+        f"«да» для подтверждения или «нет» для отмены. НЕ выполняй действие сам."
     )

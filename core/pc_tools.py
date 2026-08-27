@@ -1,13 +1,12 @@
 """
 Инструменты управления ПК/окнами/установкой приложений под нативный tool calling.
 
-БЕЗОПАСНОСТЬ (архитектура Confirmation Manager):
+БЕЗОПАСНОСТЬ (Confirmation Manager v3):
 Опасные действия (выключение, перезагрузка, установка) НЕ выполняются
 немедленно и НЕ могут быть подтверждены самой моделью. При вызове такого
-инструмента создаётся "pending action" в core/confirmation.py, который
-ожидает ЯВНОГО голосового подтверждения пользователя ('да'/'нет').
-Параметр confirm в сигнатуре оставлен для обратной совместимости, но
-ИГНОРИРУЕТСЯ — решение о выполнении принимает только пользователь.
+инструмента создаётся pending action, который проходит жизненный цикл
+pending -> prompting -> prompted и ожидает голосового «да» пользователя.
+Параметра confirm больше нет — модель физически не может его передать.
 """
 import logging
 import subprocess
@@ -61,7 +60,7 @@ def open_folder_path(path: str) -> str:
     return message
 
 
-# ============ СИСТЕМНАЯ ИНФОРМАЦИЯ (безопасно, только чтение) ============
+# ============ СИСТЕМНАЯ ИНФОРМАЦИЯ (только чтение) ============
 
 def get_system_status(info_type: str) -> str:
     """Получить информацию о системе: загрузка, процессор, память, диск, процессы.
@@ -74,16 +73,17 @@ def get_system_status(info_type: str) -> str:
 
 # ============ ПИТАНИЕ (опасно — только через голосовое подтверждение) ============
 
-def shutdown_pc(confirm: bool = False) -> str:
-    """Выключить компьютер. ОПАСНОЕ действие. При вызове создаётся запрос
-    на подтверждение — пользователь должен подтвердить голосом, сказав 'да'.
-    Параметр confirm игнорируется: подтверждение даёт только пользователь.
+def shutdown_pc() -> str:
+    """Выключить компьютер. ОПАСНОЕ действие: НЕ выполняется сразу —
+    создаёт запрос на подтверждение. Пользователь подтверждает голосом
+    («да»), подтверждение обрабатывает Confirmation Manager; модель
+    физически не может выполнить действие сама.
     """
     def _do_shutdown(payload):
         success, stdout, stderr = _run_safe_command(["shutdown", "-h", "+1"])
         if success:
             return "Выключаю систему через минуту. Скажи 'отмена выключения', чтобы отменить."
-        return f"Не получилось выключить: {stderr}"
+        return f"Не получилось: {stderr}"
 
     return request_confirmation(
         action_type="shutdown_pc",
@@ -94,15 +94,14 @@ def shutdown_pc(confirm: bool = False) -> str:
 
 
 def cancel_pc_shutdown() -> str:
-    """Отменить запланированное выключение компьютера. Безопасная операция."""
+    """Отменить запланированное выключение компьютера."""
     success, message = _cancel_shutdown()
     return message
 
 
-def reboot_pc(confirm: bool = False) -> str:
-    """Перезагрузить компьютер. ОПАСНОЕ действие — создаёт запрос на
-    подтверждение, пользователь подтверждает голосом, сказав 'да'.
-    Параметр confirm игнорируется.
+def reboot_pc() -> str:
+    """Перезагрузить компьютер. ОПАСНОЕ действие — через Confirmation
+    Manager, требует голосового подтверждения пользователя («да»).
     """
     def _do_reboot(payload):
         success, stdout, stderr = _run_safe_command(["reboot"])
@@ -167,10 +166,11 @@ def focus_window(window_number: int) -> str:
 
 # ============ УСТАНОВКА ПРИЛОЖЕНИЙ (опасно — только через голосовое подтверждение) ============
 
-def install_application(app_name: str, confirm: bool = False) -> str:
+def install_application(app_name: str) -> str:
     """Установить приложение из белого списка. ОПАСНОЕ действие — создаёт
-    запрос на подтверждение, пользователь подтверждает голосом, сказав 'да'.
-    Параметр confirm игнорируется.
+    запрос на подтверждение, пользователь подтверждает голосом («да»).
+    Пакетный менеджер (белый список, pacman/yay) не изменён — в executor
+    перенесено только само выполнение.
     Args:
         app_name: название приложения, например 'телеграм' или 'discord'
     """
@@ -178,15 +178,15 @@ def install_application(app_name: str, confirm: bool = False) -> str:
     if not package:
         return (
             f"'{app_name}' нет в белом списке известных приложений. "
-            "Установка вне белого списка через голос сейчас не поддерживается."
-        )
+            "Установка вне белого списка через голос сейчас не поддерживается — "
+            "нужно добавить приложение в список вручную.")
     if _check_installed(package):
         return f"{name} уже установлен."
 
     def _do_install(payload):
         package = payload["package"]
-        source = payload["source"]
         name = payload["name"]
+        source = payload["source"]
         if source == "aur":
             helper = _find_aur_helper()
             if not helper:
@@ -212,7 +212,7 @@ def install_application(app_name: str, confirm: bool = False) -> str:
         summary=f"Установка приложения {name}",
         payload={"package": package, "name": name, "source": source},
         executor=_do_install,
-        ttl_seconds=120,   # установка долгая — даём больше времени на подтверждение
+        ttl_seconds=120,
     )
 
 

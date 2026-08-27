@@ -10,7 +10,6 @@ BASE_SYSTEM_PROMPT = """Ты голосовой секретарь по имен
 
 ВАЖНО про память: если пользователь сообщает важный факт о себе (предпочтения, важные даты, повторяющиеся дела, личные детали) — вызови remember_fact, даже если он явно не попросил 'запомни'. Если вопрос может зависеть от того, что ты уже знаешь о пользователе — сначала вызови recall_facts."""
 
-
 class LLM:
     def __init__(self, cfg, memory=None, personality=None):
         self.fast = cfg["fast"]
@@ -21,7 +20,6 @@ class LLM:
         self.personality = personality
 
     def _build_system_prompt(self):
-        """Собирает system prompt с учётом сохранённых фактов и персонализации."""
         prompt = BASE_SYSTEM_PROMPT
         if self.personality is not None:
             prompt += f"\n\n{self.personality.get_system_prompt_fragment()}"
@@ -32,8 +30,7 @@ class LLM:
                 prompt += f"\n\nЧто уже известно о пользователе:\n{facts_block}"
         return prompt
 
-    def _build_messages(self, question, include_history: bool):
-        """Собирает messages: system prompt (+ факты) + история диалога (опц.) + вопрос."""
+    def _build_messages(self, question, include_history):
         messages = [{"role": "system", "content": self._build_system_prompt()}]
         if include_history and self.memory is not None:
             for turn in self.memory.dialog_buffer[-10:]:
@@ -42,8 +39,7 @@ class LLM:
         messages.append({"role": "user", "content": question})
         return messages
 
-    def ask(self, model, question, max_tool_hops: int = 6, include_history: bool = True):
-        """Основной метод запроса к модели с нативным tool calling."""
+    def ask(self, model, question, max_tool_hops=6, include_history=True):
         messages = self._build_messages(question, include_history)
         try:
             for _hop in range(max_tool_hops):
@@ -54,24 +50,31 @@ class LLM:
                     options={
                         "temperature": 0.3,
                         "num_predict": 300,
-                        "num_gpu": 99,
-                        "num_batch": 512,
+                        # GTX 1650 (4GB VRAM) не вмещает qwen3:8b целиком
+                        # (веса ~5-6GB в Q4 + KV cache) — ни num_gpu=99
+                        # (падал с OOM), ни отсутствие num_gpu (ушло в
+                        # 100% CPU, ответ занял ~2 минуты) не были верным
+                        # решением. Нужна ЧАСТИЧНАЯ выгрузка: явное число
+                        # слоёв, которое реально влезает, плюс урезанный
+                        # контекст, чтобы освободить место под эти слои.
+                        # 20 слоёв — стартовая точка, подбирается опытным
+                        # путём через `ollama ps` (смотри % GPU/CPU) и
+                        # `nvidia-smi` во время генерации.
+                        "num_gpu": 20,
+                        "num_ctx": 2048,
+                        "num_batch": 256,
                     },
                 )
                 msg = response["message"]
                 messages.append(msg)
-
                 tool_calls = msg.get("tool_calls")
                 if not tool_calls:
-                    # Модель ответила текстом — это финальный ответ
                     answer = (msg.get("content") or "").strip()
                     final = self.clean_response(answer) if answer else "Не понял вопрос."
                     if self.memory is not None and include_history:
                         self.memory.add_to_dialog("user", question)
                         self.memory.add_to_dialog("assistant", final)
                     return final
-
-                # Модель попросила инструменты — исполняем и продолжаем диалог
                 for call in tool_calls:
                     name = call["function"]["name"]
                     args = call["function"].get("arguments", {}) or {}
@@ -85,43 +88,28 @@ class LLM:
                         except Exception as e:
                             log.error(f"Ошибка выполнения {name}: {e}")
                             result = f"Ошибка при выполнении: {e}"
-                    messages.append({
-                        "role": "tool",
-                        "content": str(result),
-                    })
-
-            # Слишком много вызовов подряд — защита от зацикливания
+                    messages.append({"role": "tool", "content": str(result)})
             log.error("Превышен лимит последовательных вызовов инструментов")
             return "Не смог обработать запрос за разумное число шагов."
-
         except Exception as e:
             log.error(f"Ошибка: {e}")
             return "Произошла ошибка."
 
     def clean_response(self, text):
-        """Убирает артефакты форматирования из ответа модели."""
-        text = text.replace("Thinking...", "")
-        text = text.replace("...done thinking.", "")
-        text = text.replace("$$", "")
-        text = text.replace("$", "")
-        text = text.replace("\\", "")
+        text = text.replace("Thinking...", "").replace("...done thinking.", "")
+        text = text.replace("$$", "").replace("$", "").replace("\\", "")
         text = text.replace("{", "").replace("}", "")
-        text = " ".join(text.split())
-        return text.strip()
+        return " ".join(text.split()).strip()
 
     def unload(self, model):
-        """Выгружает модель из памяти."""
         try:
             self.client.chat(model=model, messages=[], keep_alive=0)
         except Exception:
             pass
 
     def is_complex(self, question):
-        """Классифицирует сложность вопроса (используется редко)."""
-        prompt = (
-            "Определи, требует ли этот вопрос глубокого экспертного ответа "
-            "или это простой вопрос. Вопрос: '" + question + "'. "
-            "Ответь одним словом: СЛОЖНЫЙ или ПРОСТОЙ."
-        )
+        prompt = ("Определи, требует ли этот вопрос глубокого экспертного ответа "
+                  "или это простой вопрос. Вопрос: '" + question + "'. "
+                  "Ответь одним словом: СЛОЖНЫЙ или ПРОСТОЙ.")
         response = self.ask(self.fast, prompt, include_history=False)
         return "СЛОЖНЫЙ" in response.upper()

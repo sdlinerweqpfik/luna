@@ -110,7 +110,9 @@ class WakeWordDetector:
             return False, 0.0
 
     def listen_once(self):
-        """Слушает одно окно и проверяет наличие слова"""
+        """Слушает одно окно и проверяет наличие слова.
+        Возвращает (is_detected, audio_16k) — audio_16k нужен для Voice ID
+        сразу после активации, чтобы не записывать отдельно ещё раз."""
         try:
             # Записываем окно
             audio = sd.rec(
@@ -122,24 +124,36 @@ class WakeWordDetector:
             )
             sd.wait()
             audio_1d = audio.squeeze()
-            
+
             # Проверяем
             is_detected, score = self.check_audio(audio_1d)
-            
-            return is_detected
-            
+
+            # Ресемплим до 16kHz для переиспользования в speaker_id
+            # (та же логика, что внутри _extract_features, но тут нужен
+            # именно ресемплированный сигнал отдельно, не мел-спектрограмма)
+            if self.samplerate != 16000:
+                audio_16k = librosa.resample(audio_1d, orig_sr=self.samplerate, target_sr=16000)
+            else:
+                audio_16k = audio_1d
+            audio_16k = audio_16k.astype(np.float32)
+
+            return is_detected, audio_16k
+
         except Exception as e:
             log.error(f"Ошибка записи: {e}")
-            return False
+            return False, None
 
     def wait_for_wake_word(self):
-        """Блокирующее ожидание слова"""
+        """Блокирующее ожидание слова.
+        Возвращает audio_16k окна активации (для Voice ID), или None если
+        по какой-то причине аудио недоступно."""
         log.info(f"Ожидаю слово '{self.wake_word}'...")
-        
+
         while True:
-            if self.listen_once():
+            is_detected, audio_16k = self.listen_once()
+            if is_detected:
                 log.info(f"Wake word '{self.wake_word}' активирован!")
-                return True
+                return audio_16k
 
     def stop(self):
         self.active = False
