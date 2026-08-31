@@ -1,12 +1,3 @@
-# advanced_task (core/advanced.py) сознательно НЕ подключён в ALL_TOOLS.
-# Причина: input() внутри _confirm_with_user блокирует голосовой поток —
-# если модель вызовет advanced_task в voice_mode, программа зависнет,
-# ожидая текстовый ввод в терминале, которого никто не даст. Плюс вызов
-# llm.ask(..., max_tool_hops=0) внутри advanced_task гарантированно не
-# сработает (range(0) не выполняется ни разу) — сам код никогда не
-# генерируется. Оба бага нужно починить осознанно, отдельным шагом, прежде
-# чем включать это обратно.
-# from core.advanced import advanced_task
 import logging
 import re
 import threading

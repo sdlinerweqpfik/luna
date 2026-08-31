@@ -9,7 +9,7 @@ whisper:
   compute_type: "int8"
   language: "ru"
   samplerate: 44100
-  
+
 audio:
   mic_device: null
   samplerate: 44100
@@ -19,7 +19,6 @@ audio:
   min_speech_duration: 0.3
   conversation_timeout: 60
   vad_aggressiveness: 1          # средний (0=мягкий, 3=строгий)
-  
   wake_model_path: "~/secretary/wakeword_training/luna_model.onnx"
   wake_threshold: 0.85
   wake_window: 1.5
@@ -29,7 +28,40 @@ audio:
 piper:
   voice: "~/piper-voices/ru_RU-irina-medium.onnx"
   samplerate: 22050
+  # Базовый голосовой режим: normal / cold.
+  # Если холодный не зайдёт — верни "normal", характер останется в тексте.
+  default_mode: "cold"
+  prosody:
+    cold:                        # «Лундере»: площе, медленнее, величественнее
+      noise_scale: 0.45
+      noise_w_scale: 0.6
+      length_scale: 1.08
+    aperture:                    # пасхалка: почти ГЛэДОС
+      noise_scale: 0.35
+      noise_w_scale: 0.5
+      length_scale: 1.1
+      pitch_steps: -2.5
 
 logging:
   file: "secretary.log"
   level: "INFO"
+
+diagnostics:
+  enabled: true
+  log_content: false   # true — логировать текст запроса (только для разработки!)
+
+# Основной сервер 
+remote:
+  enabled: true
+  host: 0.0.0.0
+  port: 8765
+  http_port: 8080
+  token: "lunamain"
+
+# Kids сервер 
+kids_remote:
+  enabled: true
+  host: 0.0.0.0
+  port: 8766
+  http_port: 8081
+  token: "lunakids"

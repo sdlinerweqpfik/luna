@@ -1,64 +1,109 @@
 """
-Инструменты памяти для tool calling.
-
-remember_fact — модель вызывает сама, когда видит важный факт о пользователе
-в разговоре (день рождения, предпочтения, повторяющиеся дела), ИЛИ когда
-пользователь явно говорит "запомни X". Оба случая — один и тот же вызов,
-разница только в том, кто инициирует: сама модель по смыслу, или пользователь
-прямой командой (которую модель тоже переводит в вызов этой функции).
-
-recall_facts — модель вызывает, когда нужно вспомнить что-то о пользователе,
-например при ответе на "что ты знаешь обо мне" или когда факт может быть
-релевантен текущему вопросу.
+Инструменты памяти для LLM tool calling.
+remember_fact / recall_facts — обратная совместимость.
+update_fact / delete_fact / list_my_facts — новые инструменты v2.
 """
 import logging
 
 log = logging.getLogger("secretary.memory_tools")
 
-# Заполняется в main.py при старте: memory_tools.MEMORY = Memory()
-# Так инструменты остаются простыми функциями без self, совместимыми
-# с form ALL_TOOLS = [список функций], как и остальные инструменты.
+# Заполняется в main.py: memory_tools.MEMORY = memory
 MEMORY = None
 
 
-def remember_fact(fact: str) -> str:
-    """Запомнить важный факт о пользователе надолго (между разговорами и перезапусками).
-    Используй это когда пользователь сообщает что-то о себе, что стоит помнить:
-    предпочтения, важные даты, повторяющиеся дела, личные детали. Также вызывай это
-    когда пользователь явно просит 'запомни'.
+def remember_fact(fact: str, category: str = "personal", importance: int = 3) -> str:
+    """Запомнить важный факт о пользователе.
+
+    Используй ТОЛЬКО для действительно полезных долгосрочных фактов:
+    предпочтения, проекты, важные даты, технические детали, привычки.
+
+    НЕ сохраняй: обычные вопросы, одноразовые действия, временные состояния,
+    содержимое диалога, предположения. Если не уверена — НЕ сохраняй.
 
     Args:
-        fact: краткая формулировка факта, например 'экзамен по химии 10 сентября'
+        fact: текст факта, например 'Люблю Portal' или 'Проект называется Luna'
+        category: одна из: preference, project, routine, important_date, personal, technical, temporary
+        importance: важность от 1 до 5 (5 = критическое, 1 = минимальное)
     """
     if MEMORY is None:
-        return "Память не инициализирована."
-    MEMORY.remember(fact)
-    return f"Запомнила: {fact}"
+        return "Память недоступна."
+    return MEMORY.add_fact(fact, category=category, importance=importance)
 
 
-def recall_facts() -> str:
-    """Вспомнить все факты, которые сохранены о пользователе. Используй это
-    когда пользователь спрашивает что ты о нём знаешь/помнишь, или когда
-    текущий вопрос может зависеть от ранее сохранённых фактов.
+def recall_facts(query: str = "") -> str:
+    """Вспомнить факты о пользователе.
+
+    Если указан запрос — вернёт релевантные факты.
+    Если пустой — вернёт самые важные общие факты.
+
+    Args:
+        query: тема поиска, например 'Minecraft' или 'предпочтения'. Пустая строка для всех важных.
     """
     if MEMORY is None:
-        return "Память не инициализирована."
-    facts = MEMORY.get_facts()
+        return "Память недоступна."
+    facts = MEMORY.recall(query)
     if not facts:
-        return "Пока ничего не запомнено."
-    return "; ".join(facts)
+        return "Ничего не помню по этому запросу."
+    lines = []
+    for f in facts:
+        lines.append(f"[{f.get('category', '?')}] {f.get('text', '')}")
+    return "\n".join(lines)
 
 
-def forget_all_facts() -> str:
-    """Полностью очистить всю долговременную память о пользователе.
-    Используй ТОЛЬКО когда пользователь явно просит забыть всё/очистить память.
+def update_fact(fact_id: str, new_text: str) -> str:
+    """Обновить существующий факт по его ID.
+
+    Используй когда пользователь просит исправить информацию.
+    ID факта можно получить через list_my_facts.
+
+    Args:
+        fact_id: ID факта (12 символов)
+        new_text: новый текст факта
     """
     if MEMORY is None:
-        return "Память не инициализирована."
-    MEMORY.long_term["facts"] = []
-    MEMORY._save_long_term()
-    MEMORY.clear_dialog()
-    return "Память очищена."
+        return "Память недоступна."
+    return MEMORY.update_fact(fact_id, new_text)
 
 
-MEMORY_TOOLS = [remember_fact, recall_facts, forget_all_facts]
+def delete_fact(fact_id: str) -> str:
+    """Удалить факт по ID.
+
+    Используй когда пользователь просит забыть что-то.
+    ID факта можно получить через list_my_facts.
+
+    Args:
+        fact_id: ID факта (12 символов)
+    """
+    if MEMORY is None:
+        return "Память недоступна."
+    return MEMORY.delete_fact(fact_id)
+
+
+def list_my_facts() -> str:
+    """Показать все сохранённые факты пользователя с их ID.
+
+    Используй когда пользователь спрашивает 'что ты обо мне помнишь?'
+    или когда нужен ID для update_fact/delete_fact.
+    """
+    if MEMORY is None:
+        return "Память недоступна."
+    facts = MEMORY.list_facts()
+    if not facts:
+        return "Пока ничего не помню о тебе."
+    lines = []
+    for f in facts:
+        lines.append(
+            f"[{f.get('id', '?')}] ({f.get('category', '?')}, "
+            f"важность {f.get('importance', '?')}): {f.get('text', '')}"
+        )
+    return "\n".join(lines)
+
+
+# Реестр для tools.py
+MEMORY_TOOLS = [
+    remember_fact,
+    recall_facts,
+    update_fact,
+    delete_fact,
+    list_my_facts,
+]

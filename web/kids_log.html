@@ -1,0 +1,46 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>👨‍👩‍👦 Журнал Луны Kids</title>
+<style>
+  html,body{height:100%;margin:0;background:#101418;font-family:monospace}
+  h1{padding:20px;color:#cfe8f5}
+  .entry{border:1px solid #2a3a44;padding:15px;margin:10px;background:#1a2228}
+  .entry.suspicious{border-color:#ff4444;background:#2a1a1a}
+  .timestamp{color:#7a8a94;font-size:0.85em;margin-bottom:8px}
+  .query{color:#4ec9b0;margin:5px 0}
+  .response{color:#cfe8f5;margin:5px 0}
+  .warning{color:#ff4444;font-weight:bold}
+</style>
+</head>
+<body>
+<h1>📋 Журнал запросов Луны Kids</h1>
+<div id="log"></div>
+<script>
+async function loadLog() {
+  try {
+    const r = await fetch('/kids_log.json');
+    const logs = await r.json();
+    const div = document.getElementById('log');
+    logs.reverse().forEach(e => {
+      const d = document.createElement('div');
+      d.className = 'entry' + (e.suspicious ? ' suspicious' : '');
+      let html = `<div class="timestamp">${e.timestamp}</div>`;
+      html += `<div class="query">👶 ${e.text}</div>`;
+      html += `<div class="response">🌙 ${e.response}</div>`;
+      if (e.suspicious) {
+        html += `<div class="warning">️ Подозрительный запрос</div>`;
+      }
+      d.innerHTML = html;
+      div.appendChild(d);
+    });
+  } catch (e) {
+    document.getElementById('log').innerHTML = '<div class="entry">Ошибка загрузки лога: ' + e + '</div>';
+  }
+}
+loadLog();
+</script>
+</body>
+</html>

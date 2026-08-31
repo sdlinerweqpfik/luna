@@ -1,232 +1,392 @@
 """
-Advanced Mode — свой lightweight интерпретатор кода.
-Использует qwen3:14b для генерации Python кода под нестандартные задачи.
-Не требует внешних зависимостей (tiktoken, open-interpreter).
+Advanced Planner v3 + Diagnostics v1.
 """
 import logging
-import subprocess
-import sys
-import tempfile
-import os
+import json
 import re
-from pathlib import Path
+import uuid
+from datetime import datetime
+from typing import Optional, Dict, Any, List
+from enum import Enum
+
+from core.tools import TOOLS_BY_NAME
+from core.confirmation import manager as confirmation_manager
+from core import security_gateway
+from core.context_manager import build_context
+from core import diagnostics
 
 log = logging.getLogger("secretary.advanced")
 
-# === ЧЁРНЫЙ СПИСОК (запрещено даже с подтверждением) ===
-FORBIDDEN_PATTERNS = [
-    r'\brm\s+(-\w+\s+)?/',           # rm -rf /
-    r'\brm\s+(-\w+\s+)?~',          # rm -rf ~
-    r'\bmkfs\b',                     # форматирование
-    r'\bdd\s+if=',                   # запись на диск
-    r'\bshutdown\b',                 # выключение
-    r'\breboot\b',                   # перезагрузка
-    r':\(\)\s*\{',                   # fork bomb
-    r'chmod\s+(-R\s+)?777',          # небезопасные права
-    r'>\s*/dev/sd',                  # запись на диск
-    r'curl.*\|\s*(bash|sh|python)',  # загрузка и выполнение
-    r'wget.*\|\s*(bash|sh|python)',
-    r'sudo\s+rm',                    # sudo + удаление
-    r'os\.system\s*\(',              # опасный os.system
-    r'subprocess\..*shell\s*=\s*True', # subprocess с shell=True
-    r'__import__',                   # динамический импорт
-    r'exec\s*\(',                    # exec в коде (двойная опасность)
-    r'eval\s*\(',                    # eval в коде
-    r'compile\s*\(',                 # compile
-]
 
-# === РАЗРЕШЁННЫЕ МОДУЛИ (whitelist для импортов) ===
-ALLOWED_MODULES = {
-    # Стандартная библиотека
-    'os', 'pathlib', 'shutil', 'glob', 'fnmatch', 'stat',
-    'datetime', 'time', 'calendar',
-    'math', 'statistics', 'random',
-    'json', 'csv', 'xml', 'html',
-    're', 'string', 'textwrap',
-    'collections', 'itertools', 'functools',
-    'hashlib', 'hmac',
-    'io', 'tempfile',
-    'typing', 'dataclasses',
-    'urllib', 'http',
-    'socket', 'email', 'mimetypes',
-    'subprocess',  # разрешён, но с ограничениями
-    'base64', 'binascii',
-    'pprint', 'copy',
-    'platform', 'sys', 'inspect',
-}
+def _now_iso() -> str:
+    return datetime.now().isoformat(timespec="seconds")
 
 
-def _extract_code(llm_response: str) -> tuple[str, str]:
-    """Извлекает Python код из ответа LLM.
-    Возвращает (код, объяснение)."""
-    # Пробуем найти блок ```python ... ```
-    match = re.search(r'```(?:python)?\s*\n(.*?)```', llm_response, re.DOTALL)
-    if match:
-        code = match.group(1).strip()
-        explanation = llm_response[:match.start()].strip()
-        if not explanation:
-            explanation = llm_response[match.end():].strip()
-        return code, explanation
-    
-    # Если нет markdown блоков — ищем строки начинающиеся с import/def/class
-    lines = llm_response.split('\n')
-    code_lines = []
-    in_code = False
-    explanation_lines = []
-    
-    for line in lines:
-        stripped = line.strip()
-        if not in_code and (stripped.startswith(('import ', 'from ', 'def ', 'class ', 'if ', 'for ', 'while ', 'print(', 'os.', 'pathlib'))):
-            in_code = True
-        if in_code:
-            code_lines.append(line)
-        else:
-            explanation_lines.append(line)
-    
-    if code_lines:
-        return '\n'.join(code_lines).strip(), '\n'.join(explanation_lines).strip()
-    
-    return "", llm_response
+class PlanState(Enum):
+    PLANNING = "planning"
+    READY = "ready"
+    RUNNING = "running"
+    STEP_RUNNING = "step_running"
+    WAITING_FOR_CONFIRMATION = "waiting_for_confirmation"
+    COMPLETED = "completed"
+    FAILED = "failed"
+    CANCELLED = "cancelled"
 
 
-def _is_safe_code(code: str) -> tuple[bool, str]:
-    """Проверяет код на опасные паттерны и неразрешённые импорты."""
-    # Проверка чёрного списка
-    for pattern in FORBIDDEN_PATTERNS:
-        if re.search(pattern, code, re.IGNORECASE):
-            return False, f"Обнаружена запрещённая конструкция: {pattern}"
-    
-    # Проверка импортов
-    import_matches = re.findall(r'^(?:import|from)\s+(\w+)', code, re.MULTILINE)
-    for module in import_matches:
-        if module not in ALLOWED_MODULES:
-            return False, f"Импорт неразрешённого модуля: {module}"
-    
-    # Проверка длины (слишком длинный код подозрителен)
-    if len(code) > 5000:
-        return False, "Код слишком длинный (>5000 символов)"
-    
-    return True, "OK"
+class StepStatus(Enum):
+    PENDING = "pending"
+    STEP_RUNNING = "step_running"
+    EXECUTED = "executed"
+    WAITING_CONFIRMATION = "waiting_confirmation"
+    FAILED = "failed"
 
 
-def _confirm_with_user(task: str, code: str, explanation: str) -> bool:
-    """Интерактивное подтверждение выполнения кода."""
-    print("\n" + "=" * 60)
-    print("🔧 РАСШИРЕННЫЙ РЕЖИМ (Advanced Mode)")
-    print("=" * 60)
-    print(f"📝 Задача: {task}")
-    if explanation:
-        print(f"💡 План: {explanation[:200]}")
-    print(f"\n💻 Сгенерированный код:\n{'─' * 40}")
-    print(code)
-    print("─" * 40)
-    print("\n⚠️  Внимание! Код будет выполнен на твоём компьютере.")
-    print("   Внимательно проверь код выше.")
-    
-    response = input("\nВыполнить? [да/нет/показать еще раз]: ").strip().lower()
-    
-    if response in ["да", "yes", "y", "ок", "выполнить", "давай"]:
-        return True
-    if response in ["показать", "еще", "again"]:
-        return _confirm_with_user(task, code, explanation)
-    return False
+class Step:
+    def __init__(self, index: int, tool_name: str, args: Dict[str, Any]):
+        self.id = uuid.uuid4().hex
+        self.index = index
+        self.tool_name = tool_name
+        self.args = args
+        self.result: Optional[str] = None
+        self.status = StepStatus.PENDING
+        self.pending_action = None
+        self.started_at: Optional[str] = None
+        self.completed_at: Optional[str] = None
+
+    def to_dict(self) -> dict:
+        return {
+            "id": self.id,
+            "index": self.index,
+            "tool": self.tool_name,
+            "args": self.args,
+            "status": self.status.value,
+            "result": self.result,
+            "pending_id": getattr(self.pending_action, "id", None),
+            "started_at": self.started_at,
+            "completed_at": self.completed_at,
+        }
+
+    def __repr__(self):
+        return f"Step({self.id[:6]}, {self.tool_name}, {self.status.value})"
 
 
-def _execute_code(code: str, timeout: int = 60) -> tuple[bool, str]:
-    """Выполняет код в изолированном subprocess."""
-    # Создаём временный файл
-    with tempfile.NamedTemporaryFile(mode='w', suffix='.py', delete=False, encoding='utf-8') as f:
-        f.write(code)
-        temp_path = f.name
-    
-    try:
-        result = subprocess.run(
-            [sys.executable, temp_path],
-            capture_output=True,
-            text=True,
-            timeout=timeout,
-            cwd=Path.home(),  # выполняем из домашней папки
-        )
-        
-        output = result.stdout.strip()
-        error = result.stderr.strip()
-        
-        if result.returncode == 0:
-            return True, output if output else "Код выполнен успешно (без вывода)"
-        else:
-            return False, f"Ошибка выполнения:\n{error}"
-    
-    except subprocess.TimeoutExpired:
-        return False, f"Код не завершился за {timeout} секунд"
-    except Exception as e:
-        return False, f"Ошибка запуска: {e}"
-    finally:
-        try:
-            os.unlink(temp_path)
-        except Exception:
-            pass
+class Plan:
+    def __init__(self, goal: str):
+        self.id = uuid.uuid4().hex
+        self.goal = goal
+        self.steps: List[Step] = []
+        self.state = PlanState.PLANNING
+        self.current_index = 0
+        self.error_message: Optional[str] = None
+        self.results: List[str] = []
+        self.created_at = _now_iso()
+
+    def to_dict(self) -> dict:
+        return {
+            "id": self.id,
+            "goal": self.goal,
+            "state": self.state.value,
+            "current_index": self.current_index,
+            "created_at": self.created_at,
+            "error": self.error_message,
+            "steps": [s.to_dict() for s in self.steps],
+        }
 
 
-def advanced_task(llm, task: str) -> str:
-    """
-    Решить нестандартную задачу путём генерации и выполнения Python кода.
-    
-    Используй ТОЛЬКО когда ни один из специализированных инструментов
-    не подходит для задачи пользователя. Например: работа с файлами
-    по шаблону, пакетная обработка, сложные вычисления, работа с данными.
-    
-    Args:
-        task: подробное описание задачи на русском языке
-    """
-    if not llm:
-        return "LLM недоступен для генерации кода."
-    
-    prompt = f"""Ты — Python-программист. Пользователь попросил решить задачу.
-Напиши Python код для её решения.
+class AdvancedPlanner:
+    MAX_STEPS = 10
+    MAX_ITERATIONS = 30
+
+    def __init__(self, llm, memory=None, personality=None):
+        self.llm = llm
+        self.memory = memory
+        self.personality = personality
+        self.active_plan: Optional[Plan] = None
+        self._cancel_requested = False
+
+    def create_plan(self, goal: str, context=None) -> Plan:
+        plan = Plan(goal)
+        self.active_plan = plan
+        plan.state = PlanState.PLANNING
+        self._cancel_requested = False
+
+        if context is None:
+            try:
+                context = build_context(
+                    request=goal, memory=self.memory, personality=self.personality
+                )
+            except Exception as e:
+                log.warning(f"Не удалось построить контекст: {e}")
+                context = None
+
+        context_block = ""
+        if context is not None:
+            lines = list(context.core_memory) + list(context.relevant_memory)
+            if lines:
+                context_block += "ИЗВЕСТНО О ПОЛЬЗОВАТЕЛЕ:\n" + "\n".join(lines) + "\n"
+            if context.active_task_summary:
+                context_block += f"АКТИВНАЯ ЗАДАЧА: {context.active_task_summary}\n"
+            if context.confirmation_hint:
+                context_block += f"СОСТОЯНИЕ: {context.confirmation_hint}\n"
+
+        prompt = f"""Ты — планировщик задач. Пользователь просит: {goal}
+
+{context_block}
+Разбей задачу на последовательные шаги. Каждый шаг — вызов одного инструмента.
+
+ДОСТУПНЫЕ ИНСТРУМЕНТЫ:
+{chr(10).join(f"- {name}" for name in sorted(TOOLS_BY_NAME.keys()))}
+
+ФОРМАТ ОТВЕТА (строго JSON):
+{{"steps": [{{"tool": "имя", "args": {{"параметр": "значение"}}}}]}}
 
 ПРАВИЛА:
-1. Используй только стандартную библиотеку Python (os, pathlib, shutil, glob, datetime, re, json, csv, math, subprocess и т.д.)
-2. Код должен быть самодостаточным и выполняемым через `python script.py`
-3. Не используй внешние библиотеки (numpy, pandas, requests и т.д.)
-4. Печатай результат через print()
-5. Добавляй комментарии на русском
-6. Обрабатывай возможные ошибки
-7. НЕ пиши пояснений — только код
+1. Используй ТОЛЬКО инструменты из списка выше
+2. Максимум {self.MAX_STEPS} шагов
+3. Каждый шаг — ОДИН инструмент
+4. Верни ТОЛЬКО JSON
+"""
 
-ЗАДАЧА: {task}
+        try:
+            response = self.llm.ask(
+                self.llm.smart, prompt, max_tool_hops=0, include_history=False
+            )
 
-Верни ТОЛЬКО код, без объяснений и markdown."""
+            json_match = re.search(r'\{.*\}', response, re.DOTALL)
+            if not json_match:
+                raise ValueError("LLM не вернул JSON")
 
-    try:
-        # Используем smart модель для лучшего кода
-        response = llm.ask(llm.smart, prompt, include_history=False, max_tool_hops=0)
-        
-        # Извлекаем код
-        code, explanation = _extract_code(response)
-        
-        if not code:
-            log.warning(f"Не удалось извлечь код из ответа: {response[:200]}")
-            return "Не смогла сгенерировать код для этой задачи."
-        
-        # Проверка безопасности
-        is_safe, reason = _is_safe_code(code)
-        if not is_safe:
-            log.warning(f"Опасный код отклонён: {reason}")
-            return f"⛔ Код отклонён системой безопасности: {reason}"
-        
-        # Подтверждение
-        if not _confirm_with_user(task, code, explanation):
-            return "Задача отменена пользователем."
-        
-        # Выполнение
-        log.info(f"Выполняю сгенерированный код для задачи: {task[:100]}")
-        success, output = _execute_code(code)
-        
-        if success:
-            return f"✅ Задача выполнена:\n{output}"
-        else:
-            return f"❌ Ошибка при выполнении:\n{output}"
-    
-    except Exception as e:
-        log.error(f"Ошибка в advanced_task: {e}")
-        return f"Не смогла обработать задачу: {e}"
+            plan_data = json.loads(json_match.group())
+            steps_data = plan_data.get("steps", [])
+
+            if not steps_data:
+                raise ValueError("План пустой")
+            if len(steps_data) > self.MAX_STEPS:
+                raise ValueError(f"Слишком много шагов: {len(steps_data)}")
+
+            steps = []
+            for i, step_data in enumerate(steps_data):
+                tool_name = step_data.get("tool")
+                if tool_name not in TOOLS_BY_NAME:
+                    raise ValueError(f"Неизвестный инструмент: {tool_name}")
+                steps.append(Step(i, tool_name, step_data.get("args", {})))
+
+            plan.steps = steps
+            plan.state = PlanState.READY
+            diagnostics.log_event("advanced", event="plan_created",
+                                  plan=plan.id[:6], steps=len(steps))
+            log.info(f"План {plan.id[:6]} создан: {len(steps)} шагов")
+            return plan
+
+        except Exception as e:
+            log.error(f"Ошибка создания плана: {e}")
+            plan.state = PlanState.FAILED
+            plan.error_message = str(e)
+            diagnostics.log_event("advanced", event="plan_failed", error=str(e)[:120])
+            return plan
+
+    def run_plan(self) -> str:
+        plan = self.active_plan
+        if plan is None:
+            return "Нет активного плана."
+        if plan.state not in (PlanState.READY, PlanState.RUNNING):
+            return f"План не готов к запуску (state={plan.state.value})."
+
+        plan.state = PlanState.RUNNING
+        iterations = 0
+
+        while plan.current_index < len(plan.steps):
+            iterations += 1
+            if iterations > self.MAX_ITERATIONS:
+                plan.state = PlanState.FAILED
+                plan.error_message = "Превышен лимит итераций"
+                return "Ошибка: превышен лимит итераций."
+
+            if self._cancel_requested:
+                self._cancel_requested = False
+                plan.state = PlanState.CANCELLED
+                plan.error_message = "План отменён пользователем"
+                diagnostics.log_event("advanced", event="plan_state", state="cancelled")
+                return "План отменён."
+
+            step = plan.steps[plan.current_index]
+
+            if step.status == StepStatus.EXECUTED:
+                plan.current_index += 1
+                continue
+
+            if step.status != StepStatus.PENDING:
+                plan.state = PlanState.FAILED
+                plan.error_message = (
+                    f"Шаг {step.id[:6]} в недопустимом состоянии {step.status.value}"
+                )
+                return f"Ошибка: шаг {step.index} нельзя запустить повторно."
+
+            step.status = StepStatus.STEP_RUNNING
+            step.started_at = _now_iso()
+            plan.state = PlanState.STEP_RUNNING
+            diagnostics.log_event("advanced", event="step_start",
+                                  step=step.index, tool=step.tool_name)
+
+            pending_before = confirmation_manager.get_active()
+
+            try:
+                result = security_gateway.execute(
+                    name=step.tool_name,
+                    fn=TOOLS_BY_NAME.get(step.tool_name),
+                    args=step.args,
+                )
+                if result == security_gateway.DENY_MESSAGE:
+                    raise ValueError("шаг запрещён политикой безопасности")
+                step.result = result
+                log.info(f"Шаг {step.index} ({step.id[:6]}) выполнен: {step.tool_name}")
+            except Exception as e:
+                log.error(f"Ошибка шага {step.index}: {e}")
+                step.status = StepStatus.FAILED
+                step.completed_at = _now_iso()
+                step.result = f"Ошибка: {e}"
+                plan.state = PlanState.FAILED
+                plan.error_message = f"Шаг {step.index} упал: {e}"
+                diagnostics.log_event("advanced", event="step_failed",
+                                      step=step.index, error=str(e)[:120])
+                return f"Ошибка на шаге {step.index}: {e}"
+
+            pending_after = confirmation_manager.get_active()
+
+            if (pending_after is not None
+                    and pending_after is not pending_before
+                    and pending_after.status == "pending"):
+                step.status = StepStatus.WAITING_CONFIRMATION
+                step.pending_action = pending_after
+                plan.state = PlanState.WAITING_FOR_CONFIRMATION
+                diagnostics.log_event("advanced", event="plan_waiting", step=step.index)
+                log.info(f"План {plan.id[:6]} ждёт подтверждения шага {step.index}")
+                return (
+                    f"Ожидает подтверждения: {pending_after.summary}. "
+                    f"Скажи «да» для продолжения или «нет» для отмены."
+                )
+
+            step.status = StepStatus.EXECUTED
+            step.completed_at = _now_iso()
+            plan.results.append(result)
+            plan.current_index += 1
+            diagnostics.log_event("advanced", event="step_done",
+                                  step=step.index, tool=step.tool_name)
+
+        if self._cancel_requested:
+            self._cancel_requested = False
+            plan.state = PlanState.CANCELLED
+            plan.error_message = "План отменён пользователем"
+            diagnostics.log_event("advanced", event="plan_state", state="cancelled")
+            return "План отменён."
+
+        plan.state = PlanState.COMPLETED
+        diagnostics.log_event("advanced", event="plan_state", state="completed")
+        log.info(f"План {plan.id[:6]} завершён")
+        return "План завершён успешно."
+
+    def resume_if_waiting(self) -> str:
+        plan = self.active_plan
+        if plan is None or plan.state != PlanState.WAITING_FOR_CONFIRMATION:
+            return ""
+
+        step = plan.steps[plan.current_index]
+        if step.pending_action is None:
+            return ""
+
+        status = step.pending_action.status
+        log.info(f"Возобновление плана {plan.id[:6]}: pending status={status}")
+        diagnostics.log_event("advanced", event="resume", status=status)
+
+        if status == "executed":
+            step.status = StepStatus.EXECUTED
+            step.completed_at = _now_iso()
+            plan.results.append(step.result or "подтверждено и выполнено")
+            plan.current_index += 1
+            step.pending_action = None
+            plan.state = PlanState.READY
+            return self.run_plan()
+
+        if status == "rejected":
+            step.status = StepStatus.FAILED
+            step.completed_at = _now_iso()
+            plan.state = PlanState.CANCELLED
+            plan.error_message = f"Шаг {step.index} отклонён пользователем"
+            diagnostics.log_event("advanced", event="plan_state", state="cancelled")
+            return "План отменён."
+
+        if status in ("expired", "aborted", "discarded"):
+            step.status = StepStatus.FAILED
+            step.completed_at = _now_iso()
+            plan.state = PlanState.FAILED
+            plan.error_message = f"Шаг {step.index}: подтверждение не получено вовремя"
+            diagnostics.log_event("advanced", event="plan_state", state="failed")
+            return "План остановлен: подтверждение не получено вовремя."
+
+        return ""
+
+    def cancel_plan(self) -> str:
+        plan = self.active_plan
+        if plan is None:
+            return "Нет активного плана."
+        if plan.state in (PlanState.COMPLETED, PlanState.FAILED, PlanState.CANCELLED):
+            return f"План уже завершён ({plan.state.value})."
+
+        if plan.state == PlanState.WAITING_FOR_CONFIRMATION:
+            step = plan.steps[plan.current_index]
+            if step.pending_action is not None:
+                confirmation_manager.reject(step.pending_action.id)
+            step.status = StepStatus.FAILED
+            step.completed_at = _now_iso()
+            plan.state = PlanState.CANCELLED
+            plan.error_message = "План отменён пользователем"
+            diagnostics.log_event("advanced", event="plan_state", state="cancelled")
+            return "План отменён."
+
+        if plan.state == PlanState.STEP_RUNNING:
+            self._cancel_requested = True
+            return ("Отмена запрошена: текущий шаг завершится штатно, "
+                    "следующие шаги не запустятся.")
+
+        plan.state = PlanState.CANCELLED
+        plan.error_message = "План отменён пользователем"
+        diagnostics.log_event("advanced", event="plan_state", state="cancelled")
+        return "План отменён."
+
+    def get_status(self) -> dict:
+        if self.active_plan is None:
+            return {"plan": None}
+        return {"plan": self.active_plan.to_dict()}
+
+
+_planner: Optional[AdvancedPlanner] = None
+
+
+def get_planner() -> Optional[AdvancedPlanner]:
+    return _planner
+
+
+def init_planner(llm, memory=None, personality=None):
+    global _planner
+    _planner = AdvancedPlanner(llm, memory=memory, personality=personality)
+
+
+def advanced_task(task: str) -> str:
+    """Решить сложную многошаговую задачу (все шаги через Security Gateway)."""
+    planner = get_planner()
+    if planner is None:
+        return "Планировщик не инициализирован."
+
+    plan = planner.create_plan(task)
+    if plan.state == PlanState.FAILED:
+        return f"Не смогла составить план: {plan.error_message}"
+
+    return planner.run_plan()
+
+
+def cancel_advanced_task() -> str:
+    """Отменить активный многошаговый план."""
+    planner = get_planner()
+    if planner is None:
+        return "Планировщик не инициализирован."
+    return planner.cancel_plan() 
