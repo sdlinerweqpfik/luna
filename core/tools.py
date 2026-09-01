@@ -50,12 +50,14 @@ def get_current_time() -> str:
 
 
 # === ПОГОДА ===
-def get_weather(city: str = "Чайковский") -> str:
+def get_weather(city: str = "") -> str:
     """Погода в указанном городе.
-
     Args:
-        city: название города (по умолчанию Чайковский)
+        city: название города (если пусто — город из профиля пользователя)
     """
+    if not city and PERSONALITY is not None:
+        city = PERSONALITY.profile.get("city", "")
+    city = city or "Москва"
     try:
         url = f"https://wttr.in/{city}?format=%C,%t,ветер %w&lang=ru"
         response = requests.get(url, timeout=5)
@@ -183,6 +185,7 @@ _active_timers = []
 # Нужен, чтобы сработавший таймер мог реально проговорить напоминание
 # голосом, а не только пикнуть. Тот же паттерн, что и MEMORY в memory_tools.py.
 TTS_INSTANCE = None
+PERSONALITY = None
 
 
 def set_timer(minutes: float, message: str = "Таймер сработал") -> str:

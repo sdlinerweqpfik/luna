@@ -28,6 +28,7 @@ class STT:
         self.language = cfg.get("language", "ru")
         self.samplerate_mic = cfg.get("samplerate", 44100)
         self.samplerate_whisper = 16000
+        self.debug_audio = cfg.get("debug_audio", False)
         print("✅ Whisper готова")
 
     def transcribe(self, audio):
@@ -61,11 +62,12 @@ class STT:
         # Фильтр шума (300-3400 Гц — диапазон человеческой речи)
         audio_1d = _bandpass_filter(audio_1d, fs=self.samplerate_whisper)
         
-        # Сохраняем аудио для отладки (опционально)
-        try:
-            sf.write("/tmp/debug_audio.wav", audio_1d, self.samplerate_whisper)
-        except Exception:
-            pass
+        # Сохраняем аудио для отладки (только если включено в конфиге)
+        if self.debug_audio:
+            try:
+                sf.write("/tmp/debug_audio.wav", audio_1d, self.samplerate_whisper)
+            except Exception:
+                pass
         
         # Параметры распознавания
         segments, info = self.model.transcribe(

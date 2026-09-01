@@ -3,6 +3,7 @@
 """
 import json
 import logging
+import re
 from datetime import datetime
 from pathlib import Path
 
@@ -50,9 +51,9 @@ def log_kids_request(text: str, response: str, source: str = "mobile", suspiciou
 
 
 def check_suspicious(text: str) -> bool:
-    """Проверить запрос на подозрительные слова."""
-    text_lower = text.lower()
-    return any(kw in text_lower for kw in SUSPICIOUS_KEYWORDS)
+    """Проверить запрос на подозрительные слова (по токенам, не подстрокам)."""
+    tokens = set(re.findall(r"[а-яёa-z]+", text.lower()))
+    return any(kw.strip() in tokens for kw in SUSPICIOUS_KEYWORDS)
 
 
 def notify_parent(text: str, response: str = "", reason: str = "подозрительный запрос"):

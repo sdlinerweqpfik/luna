@@ -22,6 +22,7 @@ from core.llm import LLM
 from core.tts import TTS
 from core.commands import fast_command
 from core.wakeword import WakeWordDetector
+from core.kids_pipeline import KidsPipeline
 from core import diagnostics
 
 from core.confirmation import manager as confirmation_manager
@@ -126,7 +127,7 @@ def _resume_advanced(tts):
             tts.speak_interruptible(resume_result)
 
 
-def conversation_mode(cfg, recorder, stt, llm, tts, log, memory, personality):
+def conversation_mode(cfg, recorder, stt, llm, tts, log, memory, personality, kids_pipeline=None, wake_audio=None):
     timeout = cfg["audio"].get("conversation_timeout", 60)
     print(f"\n💬 РЕЖИМ ДИАЛОГА ({timeout} сек)")
     print("Говори, я слушаю...")
@@ -166,6 +167,38 @@ def conversation_mode(cfg, recorder, stt, llm, tts, log, memory, personality):
 
             print(f"Вы сказали: {text}")
             log.info(f"Запрос: {text}")
+            # === Voice ID recheck по первой фразе (пункт 12) ===
+            if wake_audio is not None:
+                try:
+                    from scipy import signal as _sig
+                    import numpy as _np
+                    n16 = int(len(audio) * 16000 / recorder.samplerate)
+                    a16 = _sig.resample(_np.asarray(audio).squeeze(), n16).astype(_np.float32)
+                    combined = _np.concatenate([wake_audio, a16])
+                    rid2, dist2 = speaker_id_module.identify_speaker(combined)
+                    diagnostics.log_event("voice_id", event="recheck", speaker=rid2,
+                                        distance=round(dist2, 3) if dist2 is not None else None)
+                    kids_speakers = set(cfg.get("voice_access", {}).get("kids_speakers", ["kid"]))
+                    if rid2 in kids_speakers and kids_pipeline is None:
+                        kids_pipeline = KidsPipeline(memory=memory, personality=personality)
+                        if rid2 != memory.speaker_id:
+                            memory.switch_speaker(rid2)
+                            personality.switch_speaker(rid2)
+                        log.info(f"Voice ID recheck: детский профиль '{rid2}'")
+                    elif rid2 != "unknown" and rid2 != memory.speaker_id and kids_pipeline is None:
+                        memory.switch_speaker(rid2)
+                        personality.switch_speaker(rid2)
+                except Exception as e:
+                    log.warning(f"Voice ID recheck не сработал: {e}")
+                wake_audio = None
+            # === Детский голосовой контур (пункт 11) ===
+            if kids_pipeline is not None:
+                answer = kids_pipeline.handle(text, source="voice")
+                print(f"Луна (детский): {answer}")
+                log.info(f"Детский ответ: {answer}")
+                tts.speak_interruptible(answer)
+                last_interaction = time.time()
+                continue
 
             # === ПОДТВЕРЖДЕНИЕ ОПАСНОГО ДЕЙСТВИЯ ===
             decision, pending_action = confirmation_manager.match_user_input(text)
@@ -270,25 +303,45 @@ def voice_mode(cfg, recorder, stt, llm, tts, detector, log, memory, personality)
             print("\n🔔 Луна активирована!")
             recorder.play_beep(800, 0.15)
 
+            session_kids = False
+            voice_notice = ""
             if wake_audio is not None:
                 try:
                     recognized_id, distance = speaker_id_module.identify_speaker(wake_audio)
-                    if recognized_id != memory.speaker_id:
-                        log.info(f"Voice ID: переключение на '{recognized_id}'")
-                        memory.switch_speaker(recognized_id)
-                        personality.switch_speaker(recognized_id)
+                    diagnostics.log_event("voice_id", speaker=recognized_id,
+                                        distance=round(distance, 3) if distance is not None else None)
+                    kids_speakers = set(cfg.get("voice_access", {}).get("kids_speakers", ["kid"]))
+                    if recognized_id == "unknown":
+                        session_kids = True
+                        voice_notice = ("Не узнаю голос. Работаю в детском режиме. "
+                                            "Разблокировка — через веб-чат с паролем.")
+                        log.info("Voice ID: голос не узнан — безопасный детский режим")
+                    elif recognized_id in kids_speakers:
+                        session_kids = True
+                        if recognized_id != memory.speaker_id:
+                            memory.switch_speaker(recognized_id)
+                            personality.switch_speaker(recognized_id)
+                    else:
+                        if recognized_id != memory.speaker_id:
+                            log.info(f"Voice ID: переключение на '{recognized_id}'")
+                            memory.switch_speaker(recognized_id)
+                            personality.switch_speaker(recognized_id)
                 except Exception as e:
                     log.warning(f"Voice ID не сработал: {e}")
+            kids_pipeline = KidsPipeline(memory=memory, personality=personality) if session_kids else None
 
             if MOOD_AVAILABLE:
                 mood_engine.start_session()
             sync_voice_mode(tts)
 
             time.sleep(0.3)
-            tts.speak("Слушаю")
+            if voice_notice:
+                tts.speak(voice_notice)
+            else:
+                tts.speak("Слушаю")
             time.sleep(0.5)
 
-            conversation_mode(cfg, recorder, stt, llm, tts, log, memory, personality)
+            conversation_mode(cfg, recorder, stt, llm, tts, log, memory, personality, kids_pipeline=kids_pipeline, wake_audio=wake_audio)
 
             if MOOD_AVAILABLE:
                 mood_engine.end_session()
@@ -322,6 +375,7 @@ def main():
     tts = TTS(cfg["piper"], recorder)
 
     tools_module.TTS_INSTANCE = tts
+    tools_module.PERSONALITY = personality
     reminders_module.TTS_INSTANCE = tts
     reminders_module.schedule_all_pending()
 

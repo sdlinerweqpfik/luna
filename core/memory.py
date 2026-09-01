@@ -166,6 +166,7 @@ class Memory:
 
     def switch_speaker(self, speaker_id: str):
         self.speaker_id = speaker_id
+        self.dialog_buffer = []
 
     def _facts(self) -> List[Dict]:
         return self._data.setdefault(self.speaker_id, [])

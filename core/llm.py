@@ -56,6 +56,23 @@ class LLM:
     def ask(self, model, question, max_tool_hops=6, include_history=True):
         messages = self._build_messages(question, include_history)
         try:
+            # max_tool_hops=0: одиночная генерация БЕЗ инструментов
+            # (нужно планировщику Advanced, который ждёт чистый JSON)
+            if max_tool_hops <= 0:
+                with diagnostics.span("llm", model=model, hop=0):
+                    response = self.client.chat(
+                        model=model,
+                        messages=messages,
+                        options={
+                            "temperature": 0.3,
+                            "num_predict": 300,
+                            "num_gpu": 12,
+                            "num_ctx": 4096,
+                            "num_batch": 256,
+                        },
+                    )
+                answer = (response["message"].get("content") or "").strip()
+                return self.clean_response(answer) if answer else "Не понял вопрос."
             for _hop in range(max_tool_hops):
                 # Diagnostics: вызов модели
                 with diagnostics.span("llm", model=model, hop=_hop):
@@ -198,7 +215,7 @@ class KidsLLM:
                         result = f"Инструмент {name} недоступен."
                     else:
                         try:
-                            result = fn(**args) if args else fn()
+                            result = security_gateway.execute(name=name, fn=fn, args=args)
                         except Exception as e:
                             result = f"Ошибка инструмента: {e}"
                     
