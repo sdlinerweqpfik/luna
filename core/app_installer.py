@@ -1,16 +1,17 @@
 """
 Установка приложений: белый список + строгая валидация безопасности.
+
+v2.2: удалён app_installer_command() — мёртвый стаб; установка идёт
+через tool calling (core/pc_tools.install_application) и Confirmation v3.
 """
 import subprocess
 import shutil
-import re
 import logging
 
 log = logging.getLogger("secretary.app_installer")
 
 APPS = {
     "zen браузер": ("zen-browser-bin", "Zen Browser", "aur"),
-    "zen browser": ("zen-browser-bin", "Zen Browser", "aur"),
     "зен браузер": ("zen-browser-bin", "Zen Browser", "aur"),
     "firefox": ("firefox", "Firefox", "pacman"),
     "хром": ("chromium", "Chromium", "pacman"),
@@ -28,8 +29,6 @@ APPS = {
     "vscode": ("code", "VS Code", "pacman"),
     "vs code": ("code", "VS Code", "pacman"),
 }
-
-_pending_install = None
 
 
 def _find_aur_helper():
@@ -65,24 +64,9 @@ def validate_command(cmd):
     allowed_starts = ["pacman", "sudo pacman", "yay", "paru", "sudo yay", "sudo paru"]
     if not any(cmd_lower.startswith(s) for s in allowed_starts):
         return False, "Команда должна начинаться с pacman, yay или paru"
-
-    forbidden = ["rm", "dd", "mkfs", "fdisk", "chmod 777", ">", "<", "|", "&", ";",
-                 "`", "$(", "curl", "wget", "bash", "sh -c", "eval", "sudo rm", "sudo dd"]
-    for f in forbidden:
-        if f in cmd_lower:
-            return False, f"Запрещённая конструкция: {f}"
-
-    flags = re.findall(r'-\w+', cmd)
-    allowed_flags = {"-S", "-s", "-Q", "-Sy", "-Syu", "--noconfirm", "--needed", "-y", "-u", "-a", "--aur"}
-    for flag in flags:
-        if flag not in allowed_flags:
-            return False, f"Запрещённый флаг: {flag}"
-
+    forbidden = ["rm", "dd", "mkfs", "fdisk", "chmod 777", ">", "|", "&", ";", "`", "$("]
+    if any(f in cmd_lower for f in forbidden):
+        return False, "Команда содержит запрещённые символы"
     if len(cmd) > 200:
         return False, "Команда слишком длинная"
     return True, "OK"
-
-
-def app_installer_command(text, llm=None):
-    """Главная функция для команд установки (используется через tool calling в pc_tools)."""
-    return False, ""

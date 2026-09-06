@@ -9,7 +9,7 @@ KIDS_ALLOWED_TOOLS = [
     "get_current_time",
     "get_weather",
     "calculate",
-    "search_wikipedia",
+    "get_wikipedia",
 ]
 
 KIDS_TOOLS_BY_NAME = {

@@ -1,3 +1,4 @@
+from core.selfcheck import heartbeat
 import sounddevice as sd
 import numpy as np
 import librosa
@@ -150,6 +151,7 @@ class WakeWordDetector:
         log.info(f"Ожидаю слово '{self.wake_word}'...")
 
         while True:
+            heartbeat("voice_loop")
             is_detected, audio_16k = self.listen_once()
             if is_detected:
                 log.info(f"Wake word '{self.wake_word}' активирован!")

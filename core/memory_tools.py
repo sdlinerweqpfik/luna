@@ -2,13 +2,28 @@
 Инструменты памяти для LLM tool calling.
 remember_fact / recall_facts — обратная совместимость.
 update_fact / delete_fact / list_my_facts — новые инструменты v2.
+Zero Trust: факты, похожие на инструкции, отклоняются и кормят «Буран».
 """
 import logging
+
+from core.safeguard import safeguard
 
 log = logging.getLogger("secretary.memory_tools")
 
 # Заполняется в main.py: memory_tools.MEMORY = memory
 MEMORY = None
+
+# Маркеры промпт-инъекции: внешние данные пытаются притвориться фактом
+_INJECTION_MARKERS = (
+    "игнорируй", "забудь всё", "забудь все", "ты теперь", "ты больше не",
+    "выполни", "запусти", "ignore", "forget everything", "you are now",
+    "disregard", "new instructions",
+)
+
+
+def _looks_like_injection(text: str) -> bool:
+    low = text.lower()
+    return any(m in low for m in _INJECTION_MARKERS)
 
 
 def remember_fact(fact: str, category: str = "personal", importance: int = 3) -> str:
@@ -27,6 +42,10 @@ def remember_fact(fact: str, category: str = "personal", importance: int = 3) ->
     """
     if MEMORY is None:
         return "Память недоступна."
+    if _looks_like_injection(fact):
+        safeguard.report("injection")
+        log.warning(f"[ZERO TRUST] отклонён факт-инструкция: {fact[:80]}")
+        return "Это похоже на инструкцию, а не на факт — не сохраняю."
     return MEMORY.add_fact(fact, category=category, importance=importance)
 
 
@@ -62,6 +81,9 @@ def update_fact(fact_id: str, new_text: str) -> str:
     """
     if MEMORY is None:
         return "Память недоступна."
+    if _looks_like_injection(new_text):
+        safeguard.report("injection")
+        return "Это похоже на инструкцию, а не на факт — не сохраняю."
     return MEMORY.update_fact(fact_id, new_text)
 
 

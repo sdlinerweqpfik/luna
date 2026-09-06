@@ -1,0 +1,27 @@
+{
+  "output": {
+    "filePath": "repomix-output.xml",
+    "style": "xml"
+  },
+  "include": [
+    "main.py",
+    "remote_server.py",
+    "core/**",
+    "web/**",
+    "data/**",
+    "config*",
+    "personality*",
+    "requirements.txt",
+    "README*"
+  ],
+  "ignore": {
+    "customPatterns": [
+      "**/__pycache__/**",
+      "**/*.onnx",
+      "**/*.onnx.data",
+      "**/*.db",
+      "**/logs/**"
+    ]
+  }
+}	
+

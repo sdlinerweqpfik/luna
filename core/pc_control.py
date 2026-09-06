@@ -1,11 +1,16 @@
 """
 Безопасное управление ПК.
-Принципы: белый список команд, запрет системных папок, подтверждение опасных операций.
+Принципы: белый список команд, запрет системных папок.
+
+v2.2: удалён pc_command() — старый текстовый парсер с параллельным
+текстовым подтверждением («скажи подтверждаю выключение»), который
+обходил Confirmation Manager v3. Весь ввод теперь идёт через LLM
+tool calling (core/pc_tools.py) и шлюз. Здесь остаются только
+низкоуровневые функции, которые pc_tools использует.
 """
 import subprocess
 import os
 import logging
-from pathlib import Path
 
 log = logging.getLogger("secretary.pc_control")
 
@@ -141,56 +146,9 @@ def get_system_info(info_type):
     return True, stdout.strip()[:200]
 
 
-def shutdown_system(confirm=False):
-    """Выключение системы (только с подтверждением)"""
-    if not confirm:
-        return False, "Скажи 'подтверждаю выключение' если точно хочешь выключить"
-    success, stdout, stderr = _run_safe_command(["shutdown", "-h", "+1"])
-    if success:
-        return True, "Выключаю систему через минуту. Скажи 'отмена выключения' чтобы отменить"
-    return False, f"Не получилось: {stderr}"
-
-
 def cancel_shutdown():
     """Отмена выключения"""
     success, stdout, stderr = _run_safe_command(["shutdown", "-c"])
     if success:
         return True, "Выключение отменено"
     return False, f"Не получилось: {stderr}"
-
-
-def pc_command(text):
-    """Главная функция обработки команд ПК"""
-    text_lower = text.lower()
-
-    if any(word in text_lower for word in ["открой", "запусти", "включи"]):
-        success, answer = open_app(text_lower)
-        if success or answer:
-            return success, answer
-
-    if "папку" in text_lower or "директорию" in text_lower:
-        for word in text_lower.split():
-            if "/" in word or word.startswith("~"):
-                return open_folder(word)
-        return False, "Какую папку открыть?"
-
-    for info_type in SYSTEM_COMMANDS:
-        if info_type in text_lower:
-            return get_system_info(info_type)
-
-    if "выключи" in text_lower and any(w in text_lower for w in ["компьютер", "систему", "пк"]):
-        return shutdown_system(confirm=False)
-    if "подтверждаю выключение" in text_lower:
-        return shutdown_system(confirm=True)
-    if "отмена выключения" in text_lower:
-        return cancel_shutdown()
-
-    if "перезагрузи" in text_lower:
-        return False, "Скажи 'подтверждаю перезагрузку' если точно хочешь"
-    if "подтверждаю перезагрузку" in text_lower:
-        success, stdout, stderr = _run_safe_command(["reboot"])
-        if success:
-            return True, "Перезагружаю систему"
-        return False, f"Не получилось: {stderr}"
-
-    return False, ""

@@ -1,25 +1,22 @@
 """
 Security Gateway v1 — единая точка политики для tool calls.
-
 Маршрутизация:
-  SAFE     -> один вызов инструмента (после валидации аргументов)
-  CONFIRM  -> вызов инструмента; инструмент САМ создаёт pending
-              через Confirmation Manager. Gateway не выполняет действие
-              и не подтверждает его.
-  ADVANCED -> вызов планировщика; каждый его шаг идёт через Gateway
-  DENY     -> отказ, функция не вызывается
-
+SAFE     -> один вызов инструмента (после валидации аргументов)
+CONFIRM  -> вызов инструмента; инструмент САМ создаёт pending
+через Confirmation Manager. Gateway не выполняет действие
+и не подтверждает его.
+ADVANCED -> вызов планировщика; каждый его шаг идёт через Gateway
+DENY     -> отказ, функция не вызывается
 Принципы:
-- default DENY: инструмента нет в таблице -> отказ
-- Gateway не запускает внешние процессы и не выполняет код
-- Gateway не подтверждает действия и не заменяет Confirmation Manager
-- аргументы от LLM не доверены: доверенные ключи вырезаются
+default DENY: инструмента нет в таблице -> отказ
+Gateway не запускает внешние процессы и не выполняет код
+Gateway не подтверждает действия и не заменяет Confirmation Manager
+аргументы от LLM не доверены: доверенные ключи вырезаются
 """
 import logging
 from pathlib import Path
-
+from core.safeguard import safeguard
 log = logging.getLogger("secretary.security")
-
 SAFE = "SAFE"
 CONFIRM = "CONFIRM"
 ADVANCED = "ADVANCED"
@@ -35,6 +32,8 @@ TOOL_POLICIES = {
     "get_currency_rate": SAFE,
     "get_wikipedia": SAFE,
     "set_timer": SAFE,
+    "phone_timer": SAFE,            # ← НОВОЕ
+    "open_phone_app": SAFE,         # ← НОВОЕ
     "add_shopping_item": SAFE,
     "show_shopping_list": SAFE,
     "remove_shopping_item": SAFE,
@@ -45,24 +44,40 @@ TOOL_POLICIES = {
     "clear_tasks": SAFE,
     "remember_fact": SAFE,
     "recall_facts": SAFE,
+    # SAFE: память v2 CRUD
+    "update_fact": SAFE,
+    "delete_fact": SAFE,
+    "list_my_facts": SAFE,
+    # SAFE: чувства ПК, триггеры, проактивность
+    "read_open_tabs": SAFE,
+    "create_trigger": SAFE,
+    "delete_trigger": SAFE,
+    "show_triggers_tool": SAFE,
+    "toggle_proactive_tool": SAFE,
+    # SAFE: артефакты (песочница ~/Luna/artifacts, запись только туда)
+    "save_artifact": SAFE,
+    "create_presentation": SAFE,
     # SAFE: PC (core/pc_tools.py)
     "get_system_status": SAFE,
-    "open_application": SAFE,           # whitelist внутри инструмента
-    "open_folder_path": SAFE,           # + path-валидация Gateway
+    "open_application": SAFE,
+    "open_folder_path": SAFE,
     "cancel_pc_shutdown": SAFE,
     "show_desktop": SAFE,
     "minimize_current_window": SAFE,
     "maximize_current_window": SAFE,
-    "close_current_window": SAFE,       # UI-действие
+    "close_current_window": SAFE,
     "list_open_windows": SAFE,
     "switch_to_next_window": SAFE,
     "focus_window": SAFE,
+    # SAFE: отмена плана
+    "cancel_advanced_task": SAFE,
     # CONFIRM: изменяют систему; pending создаёт сам инструмент
     "shutdown_pc": CONFIRM,
     "reboot_pc": CONFIRM,
     "install_application": CONFIRM,
     # ADVANCED: планировщик, шаги идут через Gateway
     "advanced_task": ADVANCED,
+    "release_safeguard": CONFIRM,
 }
 
 # Явный DENY для попыток произвольного выполнения
@@ -72,37 +87,31 @@ EXPLICIT_DENY = {
     "subprocess_run", "run_python", "bash", "cmd",
 }
 
-# Ключи, которые LLM не может задавать как доверенные
 UNTRUSTED_ARG_KEYS = {
     "confirm", "approved", "user_confirmed", "source", "authorized",
     "authenticated", "authorization_level", "admin", "sudo", "trusted",
 }
 
 PATH_ARG_KEYS = {"path", "folder", "directory", "folder_path"}
-
 FORBIDDEN_PATH_PREFIXES = (
     "/etc", "/root", "/sys", "/proc", "/boot", "/usr", "/var",
     "/bin", "/sbin", "/lib", "/opt", "/dev", "/srv",
 )
-
 DENY_MESSAGE = "Это действие запрещено политикой безопасности."
 
 
 def classify(name):
-    """Классификация инструмента. Default = DENY."""
     if name in EXPLICIT_DENY:
         return DENY
     return TOOL_POLICIES.get(name, DENY)
 
 
 def _sanitize_args(args):
-    """Вырезает доверенные ключи из аргументов LLM."""
     return {k: v for k, v in (args or {}).items()
             if k not in UNTRUSTED_ARG_KEYS}
 
 
 def _validate_path(value):
-    """Путь должен вести внутрь home; обходы запрещены."""
     if not isinstance(value, str) or not value.strip():
         return False
     raw = value.strip()
@@ -123,9 +132,6 @@ def _validate_path(value):
 
 
 def _validate_args(name, args):
-    """Policy-валидация аргументов.
-    Пакетные/белосписочные проверки остаются в инструментах
-    (install_application: APPS-whitelist — авторитетный слой)."""
     for key in PATH_ARG_KEYS:
         if key in args and not _validate_path(args[key]):
             return False, "path"
@@ -133,19 +139,12 @@ def _validate_args(name, args):
 
 
 def execute(name, fn, args=None, context=None):
-    """Единственная точка выполнения tool call из LLM и Advanced.
-
-    context принимается, но доверенные поля (source и т.п.) НИКОГДА
-    не читаются из аргументов модели и не могут быть ею заданы.
-    """
     policy = classify(name)
-
     if fn is None or policy == DENY:
         log.warning(f"[SECURITY] DENY {name}")
+        safeguard.report("deny")
         return DENY_MESSAGE
-
     args = _sanitize_args(args)
-
     if policy == SAFE:
         ok, kind = _validate_args(name, args)
         if not ok:
@@ -153,16 +152,11 @@ def execute(name, fn, args=None, context=None):
             return f"Недопустимый аргумент для {name}."
         log.info(f"[SECURITY] ALLOW {name}")
         return fn(**args)
-
     if policy == CONFIRM:
-        # Инструмент сам создаёт pending через request_confirmation.
-        # Gateway НЕ выполняет действие и НЕ подтверждает его.
         log.info(f"[SECURITY] CONFIRM {name}")
         return fn(**args)
-
     if policy == ADVANCED:
         log.info(f"[SECURITY] ADVANCED {name}")
         return fn(**args)
-
     log.warning(f"[SECURITY] DENY {name}")
     return DENY_MESSAGE

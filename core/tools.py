@@ -2,23 +2,31 @@ import logging
 import re
 import threading
 from ddgs import DDGS
+from core.proactive import add_trigger, remove_trigger, show_triggers, toggle_proactive
+import threading as _phone_thread
 from datetime import datetime
-import requests
 
+import requests
 from core.lists import (
     shopping_add, shopping_show, shopping_remove, shopping_clear,
     tasks_add, tasks_show, tasks_done, tasks_clear
 )
 from core.pc_tools import PC_TOOLS
 from core.memory_tools import MEMORY_TOOLS
+from core import senses
+from core.proactive import add_trigger, remove_trigger, show_triggers, toggle_proactive
+
+try:
+    from core.artifacts import save_artifact, create_presentation
+    _ART_TOOLS = [save_artifact, create_presentation]
+except Exception:
+    _ART_TOOLS = []
 
 log = logging.getLogger("secretary.tools")
-
 
 # === ПОИСК В ИНТЕРНЕТЕ ===
 def search_web(query: str, num_results: int = 3) -> str:
     """Поиск в интернете для новостей, фактов и любой актуальной информации.
-
     Args:
         query: поисковый запрос
         num_results: сколько результатов вернуть (по умолчанию 3)
@@ -36,7 +44,6 @@ def search_web(query: str, num_results: int = 3) -> str:
         log.error(f"Ошибка поиска: {e}")
         return "Ошибка при поиске."
 
-
 # === ВРЕМЯ И ДАТА ===
 def get_current_time() -> str:
     """Текущее время и дата."""
@@ -47,7 +54,6 @@ def get_current_time() -> str:
     day_name = days[now.weekday()]
     month_name = months[now.month - 1]
     return f"Сейчас {now.hour} часов {now.minute} минут, {day_name}, {now.day} {month_name} {now.year} года."
-
 
 # === ПОГОДА ===
 def get_weather(city: str = "") -> str:
@@ -67,11 +73,9 @@ def get_weather(city: str = "") -> str:
     except Exception:
         return "Ошибка получения погоды."
 
-
 # === КАЛЬКУЛЯТОР ===
 def calculate(expression: str) -> str:
     """Математический калькулятор для точных вычислений.
-
     Args:
         expression: выражение для вычисления, можно словами ('два плюс два') или знаками
     """
@@ -85,55 +89,43 @@ def calculate(expression: str) -> str:
         expr = expr.replace("процент", "*0.01").replace("процентов", "*0.01")
         expr = expr.replace("корень из", "sqrt").replace("корень", "sqrt")
         expr = expr.replace(",", ".").replace("х", "*").replace("×", "*").replace("÷", "/")
-
         expr = re.sub(r'[^0-9+\-*/().sqrt ]', '', expr)
-
         if not expr.strip():
             return "Не понял выражение."
-
         import math
         allowed_names = {"sqrt": math.sqrt, "abs": abs, "round": round}
         result = eval(expr, {"__builtins__": {}}, allowed_names)
-
         if isinstance(result, float) and result == int(result):
             result = int(result)
-
         return f"Результат: {result}"
     except Exception as e:
         log.error(f"Ошибка калькулятора: {e}")
         return "Не смог посчитать. Попробуй переформулировать."
 
-
 # === КУРС ВАЛЮТ ЦБ РФ ===
 def get_currency_rate(currency: str = "USD") -> str:
     """Курс валют ЦБ РФ.
-
     Args:
         currency: код или название валюты, например USD, EUR
     """
     try:
         response = requests.get("https://www.cbr-xml-daily.ru/daily_json.js", timeout=5)
         data = response.json()
-
         currency_up = currency.upper()
         if currency_up in data["Valute"]:
             valute = data["Valute"][currency_up]
             return f"Курс {valute['Name']}: {valute['Value']} рублей за {valute['Nominal']} {valute['CharCode']}."
-
         for code, valute in data["Valute"].items():
             if currency.lower() in valute["Name"].lower():
                 return f"Курс {valute['Name']}: {valute['Value']} рублей за {valute['Nominal']} {valute['CharCode']}."
-
         return f"Валюта {currency} не найдена."
     except Exception as e:
         log.error(f"Ошибка курса валют: {e}")
         return "Не удалось получить курс."
 
-
 # === ВИКИПЕДИЯ ===
 def get_wikipedia(query: str) -> str:
     """Краткая информация из Википедии по запросу.
-
     Args:
         query: тема или название статьи для поиска
     """
@@ -150,14 +142,12 @@ def get_wikipedia(query: str) -> str:
         }
         response = requests.get(url, params=params, timeout=5)
         data = response.json()
-
         pages = data["query"]["pages"]
         for page_id, page in pages.items():
             if page_id != "-1":
                 extract = page.get("extract", "Статья не найдена.")
                 sentences = extract.split(". ")[:3]
                 return ". ".join(sentences) + "."
-
         search_params = {
             "action": "query",
             "format": "json",
@@ -167,32 +157,23 @@ def get_wikipedia(query: str) -> str:
         }
         search_response = requests.get(url, params=search_params, timeout=5)
         search_data = search_response.json()
-
         if search_data["query"]["search"]:
             title = search_data["query"]["search"][0]["title"]
             return get_wikipedia(title)
-
         return f"Не нашёл информацию про '{query}' в Википедии."
     except Exception as e:
         log.error(f"Ошибка Википедии: {e}")
         return "Ошибка при поиске в Википедии."
 
-
 # === ТАЙМЕР / НАПОМИНАНИЕ ===
 _active_timers = []
-
-# Заполняется в main.py при старте: tools.TTS_INSTANCE = tts
-# Нужен, чтобы сработавший таймер мог реально проговорить напоминание
-# голосом, а не только пикнуть. Тот же паттерн, что и MEMORY в memory_tools.py.
 TTS_INSTANCE = None
 PERSONALITY = None
-
 
 def set_timer(minutes: float, message: str = "Таймер сработал") -> str:
     """Ставит таймер или напоминание через указанное количество минут.
     Когда сработает — Луна САМА проговорит сообщение голосом, без
     необходимости говорить wake word заново.
-
     Args:
         minutes: через сколько минут сработает таймер
         message: что сказать, когда сработает
@@ -212,84 +193,169 @@ def set_timer(minutes: float, message: str = "Таймер сработал") ->
             try:
                 import subprocess
                 subprocess.run(["paplay", "/usr/share/sounds/freedesktop/stereo/alarm-clock-elapsed.oga"],
-                             timeout=5, capture_output=True)
+                               timeout=5, capture_output=True)
             except Exception:
                 print("\a" * 5)
 
         timer = threading.Timer(seconds, timer_callback)
         timer.start()
         _active_timers.append(timer)
-
         if minutes < 1:
             time_str = f"{int(seconds)} секунд"
         elif minutes == int(minutes):
             time_str = f"{int(minutes)} минут"
         else:
             time_str = f"{minutes} минут"
-
         return f"Таймер на {time_str} установлен. Я напомню: {message}"
     except Exception as e:
         log.error(f"Ошибка таймера: {e}")
         return "Не смог установить таймер."
 
+# === ТЕЛЕФОН-ДЕЙСТВИЯ: таймеры и приложения на телефоне ===
+# Телефонные инструменты ничего не исполняют на ПК: они кладут action
+# в thread-local sink, remote_server вытаскивает и шлёт телефону по WS.
+_phone_local = _phone_thread.local()
+
+
+def _push_phone_action(action: dict):
+    lst = getattr(_phone_local, "actions", None)
+    if lst is None:
+        lst = []
+        _phone_local.actions = lst
+    lst.append(action)
+
+
+def drain_phone_actions() -> list:
+    """Вернуть и очистить действия для телефона, накопленные в этом потоке."""
+    lst = getattr(_phone_local, "actions", None)
+    if not lst:
+        return []
+    _phone_local.actions = []
+    return lst
+
+
+def phone_timer(minutes: float, message: str = "Таймер сработал") -> str:
+    """Ставит таймер или напоминание НА ТЕЛЕФОНЕ пользователя (не на ПК).
+    Используй когда пользователь общается с телефона или явно просит
+    напомнить на телефоне. Для напоминания на ПК используй set_timer.
+    Args:
+        minutes: через сколько минут сработает таймер (дробное допустимо)
+        message: что показать в уведомлении при срабатывании
+    """
+    try:
+        minutes = float(minutes)
+    except Exception:
+        return "Не поняла, сколько минут."
+    if minutes <= 0 or minutes > 1440:
+        return "Таймер на телефоне: от 1 минуты до 24 часов."
+    _push_phone_action({
+        "action": "phone_timer",
+        "minutes": minutes,
+        "message": str(message)[:200]
+    })
+    m_str = f"{int(minutes)}" if minutes == int(minutes) else f"{minutes}"
+    return f"Таймер на {m_str} мин отправлен на телефон. Напомню: {message}"
+
+
+def open_phone_app(app_name: str) -> str:
+    """Открывает приложение НА ТЕЛЕФОНЕ пользователя (не на ПК).
+    Для приложений на ПК используй open_application.
+    Args:
+        app_name: название приложения, например 'youtube', 'telegram', 'карты'
+    """
+    name = str(app_name).strip().lower()[:50]
+    if not name:
+        return "Какое приложение открыть?"
+    _push_phone_action({"action": "open_app", "app": name})
+    return f"Команда отправлена на телефон: открыть '{name}'."
 
 # === СПИСКИ ПОКУПОК И ЗАДАЧ ===
-
 def add_shopping_item(item: str) -> str:
     """Добавить товар в список покупок.
-
     Args:
         item: название товара
     """
     return shopping_add(item)
 
-
 def show_shopping_list() -> str:
     """Показать текущий список покупок."""
     return shopping_show()
 
-
 def remove_shopping_item(item: str) -> str:
     """Удалить товар из списка покупок.
-
     Args:
         item: название товара
     """
     return shopping_remove(item)
 
-
 def clear_shopping_list() -> str:
     """Полностью очистить список покупок."""
     return shopping_clear()
 
-
 def add_task(task: str) -> str:
     """Добавить задачу в список дел.
-
     Args:
         task: текст задачи
     """
     return tasks_add(task)
 
-
 def show_tasks() -> str:
     """Показать список задач."""
     return tasks_show()
 
-
 def complete_task(task: str) -> str:
     """Отметить задачу выполненной.
-
     Args:
         task: текст задачи (как в списке)
     """
     return tasks_done(task)
 
-
 def clear_tasks() -> str:
     """Полностью очистить список задач."""
     return tasks_clear()
 
+# === ЧТЕНИЕ ЭКРАНА: ОКНА И ВКЛАДКИ ===
+def read_open_tabs() -> str:
+    """Показывает, что сейчас открыто на ПК: активное окно, вкладки браузера, запущенные приложения."""
+    snap = senses.snapshot()
+    parts = []
+    if snap["active_window"]:
+        parts.append("Активное окно: " + snap["active_window"])
+    if snap["windows"]:
+        parts.append("Открыты окна: " + "; ".join(snap["windows"]))
+    if snap["apps"]:
+        parts.append("Запущены: " + ", ".join(snap["apps"]))
+    if not parts:
+        return "Не вижу открытых окон."
+    return ". ".join(parts)
+
+# === ТРИГГЕРЫ И ПРОАКТИВНОСТЬ ===
+def create_trigger(event: str, condition: str, action: str) -> str:
+    """Создаёт правило: когда событие сработает, Луна сама озвучит напоминание СВОИМИ словами.
+    Args:
+        event: тип события: app_started (запуск приложения), tab_focus (открыта вкладка/окно), time (время HH:MM)
+        condition: подстрока названия приложения или окна, либо время вида 08:00
+        action: что напомнить или прокомментировать (Луна переформулирует сама)
+    """
+    return add_trigger(event, condition, action)
+
+def delete_trigger(index: int) -> str:
+    """Удаляет правило-триггер по номеру из списка.
+    Args:
+        index: номер правила (смотри show_triggers)
+    """
+    return remove_trigger(index)
+
+def show_triggers_tool() -> str:
+    """Показывает все активные правила-триггеры."""
+    return show_triggers()
+
+def toggle_proactive_tool(enabled: bool) -> str:
+    """Включает или выключает проактивность Луны (её собственные реплики и правила).
+    Args:
+        enabled: true включить, false выключить
+    """
+    return toggle_proactive(enabled)
 
 # === РЕЕСТР ИНСТРУМЕНТОВ ===
 ALL_TOOLS = [
@@ -308,6 +374,13 @@ ALL_TOOLS = [
     show_tasks,
     complete_task,
     clear_tasks,
-] + PC_TOOLS + MEMORY_TOOLS
+    read_open_tabs,
+    create_trigger,
+    delete_trigger,
+    show_triggers_tool,
+    toggle_proactive_tool,
+    phone_timer,         
+    open_phone_app,
+] + PC_TOOLS + MEMORY_TOOLS + _ART_TOOLS
 
 TOOLS_BY_NAME = {fn.__name__: fn for fn in ALL_TOOLS}

@@ -214,10 +214,31 @@ def install_application(app_name: str) -> str:
         executor=_do_install,
         ttl_seconds=120,
     )
+ 
+# ============ СБРОС БЕЗОПАСНОГО РЕЖИМА (опасно — через голосовое подтверждение) ============
+def release_safeguard() -> str:
+    """Снять безопасный режим «Буран» досрочно. ОПАСНОЕ действие: создаёт
+    запрос на подтверждение, пользователь подтверждает голосом («да»).
+    Снятие через обычный текст без подтверждения было бы бэкдором —
+    любой в комнате мог бы снять защиту фразой.
+    """
+    from core.safeguard import safeguard
 
+    def _do_release(payload):
+        safeguard.release()
+        return "Безопасный режим снят. Все слои в строю."
+
+    return request_confirmation(
+        action_type="release_safeguard",
+        summary="Досрочное снятие безопасного режима",
+        payload={},
+        executor=_do_release,
+        ttl_seconds=60,
+    )
 
 # ============ РЕЕСТР ДЛЯ tools.py ============
 
+# ============ РЕЕСТР ДЛЯ tools.py ============
 PC_TOOLS = [
     open_application,
     open_folder_path,
@@ -233,4 +254,5 @@ PC_TOOLS = [
     switch_to_next_window,
     focus_window,
     install_application,
+    release_safeguard,  
 ]

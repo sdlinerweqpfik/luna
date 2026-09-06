@@ -7,6 +7,7 @@ import logging
 import sys
 import time
 
+from core.selfcheck import heartbeat
 from core.memory import Memory
 from core.personality import Personality
 import core.memory_tools as memory_tools
@@ -26,7 +27,10 @@ from core.kids_pipeline import KidsPipeline
 from core import diagnostics
 
 from core.confirmation import manager as confirmation_manager
-from core.advanced import init_planner, get_planner, advanced_task
+from core.advanced import (init_planner, get_planner,
+                           advanced_task, cancel_advanced_task)
+from core import safeguard as safeguard_module
+from core.routing import is_complex_fast
 
 try:
     from core.mood_engine import engine as mood_engine
@@ -36,20 +40,6 @@ except ImportError:
     MOOD_AVAILABLE = False
 
 
-def is_complex_fast(text):
-    text_lower = text.lower()
-    complex_keywords = [
-        "объясни", "расскажи подробно", "почему", "зачем",
-        "сравни", "проанализируй", "напиши", "сочини",
-        "придумай", "переведи", "объясни как",
-        "квантов", "философ", "история", "наука",
-        "стих", "рассказ", "эссе", "сочинение",
-    ]
-    word_count = len(text_lower.split())
-    for kw in complex_keywords:
-        if kw in text_lower:
-            return True
-    return word_count > 15
 
 
 def sync_voice_mode(tts):
@@ -137,8 +127,16 @@ def conversation_mode(cfg, recorder, stt, llm, tts, log, memory, personality, ki
 
     while True:
         try:
+            heartbeat("voice_loop")
             elapsed = time.time() - last_interaction
 
+                        # Проверяем безопасный режим
+            if safeguard_module.safeguard.is_safe_mode():
+                remaining = safeguard_module.safeguard.remaining()
+                tts.speak_interruptible(
+                    f"Безопасный режим ещё {remaining} секунд. Сложные задачи отключены."
+                )
+                continue
             if elapsed >= timeout and not confirmation_manager.has_pending():
                 print(f"\n👋 Таймаут ({timeout} сек), прощаюсь...")
                 time.sleep(0.5)
@@ -262,7 +260,7 @@ def conversation_mode(cfg, recorder, stt, llm, tts, log, memory, personality, ki
                 mood_engine.check_triggers(text=text)
 
             exit_words = text.lower().split()
-            if any(word in exit_words for word in ["пока", "выход", "хватит", "закрой"]):
+            if any(word in exit_words for word in ["пока", "выход", "хватит"]):
                 print("👋 Команда выхода")
                 tts.speak("До свидания!")
                 recorder.play_beep(400, 0.3)
@@ -327,9 +325,12 @@ def voice_mode(cfg, recorder, stt, llm, tts, detector, log, memory, personality)
                             memory.switch_speaker(recognized_id)
                             personality.switch_speaker(recognized_id)
                 except Exception as e:
-                    log.warning(f"Voice ID не сработал: {e}")
+                    # 🛡️ FAIL-CLOSED (GPT C-4, Claude): при ошибке Voice ID
+                    # переходим в безопасный (детский) режим, а не во взрослый.
+                    log.warning(f"Voice ID не сработал: {e}. Переход в безопасный режим.")
+                    session_kids = True
+                    voice_notice = "Не удалось подтвердить голос. Работаю в безопасном режиме."
             kids_pipeline = KidsPipeline(memory=memory, personality=personality) if session_kids else None
-
             if MOOD_AVAILABLE:
                 mood_engine.start_session()
             sync_voice_mode(tts)
@@ -361,8 +362,45 @@ def voice_mode(cfg, recorder, stt, llm, tts, detector, log, memory, personality)
 
 def main():
     cfg = load_config("config.yaml")
+        # 🛡️ PER-INSTALL ТОКЕН (GPT C-1, Gemini #3)
+    import secrets
+    from pathlib import Path
+    token_file = Path.home() / "Luna" / "remote_token.txt"
+    if not token_file.exists():
+        new_token = secrets.token_urlsafe(32)
+        token_file.parent.mkdir(parents=True, exist_ok=True)
+        token_file.write_text(new_token)
+        print(f"\n🔑 Сгенерирован новый токен Remote: {new_token}")
+        print(f"   Сохранён в {token_file}")
+        print(f"   Используй его в веб-чате вместо 'lunamain'.\n")
+    else:
+        fresh_token = token_file.read_text().strip()
+        if "remote" in cfg:
+            cfg["remote"]["token"] = fresh_token
+        if "kids_remote" in cfg:
+            cfg["kids_remote"]["token"] = fresh_token + "_kids"
     setup_logging(cfg["logging"])
     diagnostics.init(cfg.get("diagnostics", {}))
+    
+    # 🛡️ ГЕНЕРАЦИЯ PER-INSTALL ТОКЕНА
+    import secrets
+    from pathlib import Path
+    token_file = Path.home() / "Luna" / "remote_token.txt"
+    if not token_file.exists():
+        new_token = secrets.token_urlsafe(32)
+        token_file.parent.mkdir(parents=True, exist_ok=True)
+        token_file.write_text(new_token)
+        print(f"🔑 Сгенерирован новый токен для Remote: {new_token}")
+        print("   Сохрани его и используй в веб-чате. Старый 'lunamain' больше не работает.")
+    else:
+        # Перезаписываем токен в конфиге на лету, не трогая config.yaml
+        cfg["remote"]["token"] = token_file.read_text().strip()
+        cfg["kids_remote"]["token"] = token_file.read_text().strip() + "_kids"
+    
+    from core import veil
+    veil.try_load_key()
+    if veil.is_veiled():
+        print("🎭 Занавес опущен. Луна работает с амнезией до снятия занавеса.")
     log = logging.getLogger("secretary.main")
 
     memory = Memory(speaker_id="default")
@@ -375,6 +413,17 @@ def main():
     tts = TTS(cfg["piper"], recorder)
 
     tools_module.TTS_INSTANCE = tts
+    safeguard_module.TTS_INSTANCE = tts
+        # === САМОПРОВЕРКА КОНТУРА ===
+    from core.selfcheck import SelfCheckLoop, heartbeat as _hb, check_integrity
+    startup_check = check_integrity()
+    if startup_check["missing_manifest"]:
+        log.info("🔏 Манифест не найден. Опечатай контур: "
+                 "python -c 'from core.selfcheck import seal; seal()'")
+    elif not startup_check["ok"]:
+        log.warning(f"🚨 ЦЕЛОСТНОСТЬ НАРУШЕНА ПРИ СТАРТЕ: {startup_check['violations']}")
+        tts.speak("Внимание: целостность контура нарушена при запуске. Безопасный режим.")
+    SelfCheckLoop(tts=tts).start()
     tools_module.PERSONALITY = personality
     reminders_module.TTS_INSTANCE = tts
     reminders_module.schedule_all_pending()
@@ -382,6 +431,9 @@ def main():
     init_planner(llm, memory=memory, personality=personality)
     tools_module.ALL_TOOLS.append(advanced_task)
     tools_module.TOOLS_BY_NAME[advanced_task.__name__] = advanced_task
+
+    tools_module.ALL_TOOLS.append(cancel_advanced_task)
+    tools_module.TOOLS_BY_NAME[cancel_advanced_task.__name__] = cancel_advanced_task
 
     remote_cfg = cfg.get("remote", {})
     if remote_cfg.get("enabled"):
